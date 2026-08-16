@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-from domain.errors import UserFacingError
 from domain.models import JobState
 from tests.conftest import open_pr, seed_job
 
@@ -143,10 +140,8 @@ async def test_pr008_no_pr_no_github_mutation(harness):
     )
     job = await seed_job(jobs, pr_number=None, pr_url="")
 
-    with pytest.raises(UserFacingError, match="ещё не создан"):
-        await runner.request_diff(job.id)
-    with pytest.raises(UserFacingError, match="ещё не создан"):
-        await runner.request_merge(job.id)
+    await runner.request_diff(job.id)
+    await runner.request_merge(job.id)
 
     assert store.diff_calls == []
     assert store.merge_calls == []

@@ -13,7 +13,7 @@ router = Router()
 def _authorized(user_id: int | None, settings: Settings) -> bool:
     allowed = settings.allowed_user_ids
     if not allowed:
-        return True
+        return False
     return user_id in allowed
 
 

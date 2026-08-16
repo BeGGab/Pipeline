@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 
+from adapters.coding_agent.issue_refs import extract_issue_number
 from adapters.github.issues import _COPILOT_ASSIGNEE_ALIASES
 from config.settings import Settings
 from domain.models import EventType, PipelineEvent
@@ -29,6 +30,7 @@ class CodingAgentAdapter:
         self._seen_comment_ids: set[str] = set()
         self._seen_pr_ids: set[int] = set()
         self._seen_run_ids: set[int] = set()
+        self._draft_seen: set[int] = set()
 
     def _is_coding_agent_login(self, login: str) -> bool:
         allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
@@ -46,7 +48,11 @@ class CodingAgentAdapter:
     ) -> bool:
         if pr_number:
             pr = await self.github.pull_requests.get_pull_request(pr_number)
-            if pr.draft is False or pr.requested_reviewers:
+            if pr.requested_reviewers:
+                return True
+            if pr.draft:
+                self._draft_seen.add(pr_number)
+            elif pr_number in self._draft_seen:
                 return True
         if await self._issue_is_closed(issue_number):
             return True
@@ -87,13 +93,10 @@ class CodingAgentAdapter:
 
     async def watch_issue(self, issue_number: int) -> AsyncIterator[PipelineEvent]:
         interval = self.settings.coding_agent_poll_interval_sec
-        timeout = self.settings.coding_agent_poll_timeout_sec
-        elapsed = 0
-        while elapsed < timeout:
+        while True:
             async for event in self._poll_once(issue_number):
                 yield event
             await asyncio.sleep(interval)
-            elapsed += interval
 
     async def _poll_once(self, issue_number: int) -> AsyncIterator[PipelineEvent]:
         comments = await self.github.comments.list_issue_comments(issue_number)
@@ -109,17 +112,21 @@ class CodingAgentAdapter:
         pulls = await self.github.pull_requests.list_pulls_for_issue(issue_number)
         for raw in pulls:
             number = raw.get("number")
-            if not number or number in self._seen_pr_ids:
+            if not number:
                 continue
-            self._seen_pr_ids.add(number)
             pr = await self.github.pull_requests.get_pull_request(number)
-            yield PipelineEvent(
-                event_id=f"pr-opened-{number}",
-                type=EventType.PR_OPENED,
-                issue_number=issue_number,
-                pr_number=number,
-                payload={"html_url": pr.html_url, "head_ref": pr.head_ref},
-            )
+            if pr.draft:
+                self._draft_seen.add(number)
+            first_seen = number not in self._seen_pr_ids
+            if first_seen:
+                self._seen_pr_ids.add(number)
+                yield PipelineEvent(
+                    event_id=f"pr-opened-{number}",
+                    type=EventType.PR_OPENED,
+                    issue_number=issue_number,
+                    pr_number=number,
+                    payload={"html_url": pr.html_url, "head_ref": pr.head_ref},
+                )
             if await self.detect_task_completion(issue_number, number):
                 yield PipelineEvent(
                     event_id=f"agent-completed-{number}",
@@ -256,29 +263,32 @@ class CodingAgentAdapter:
         number = pr.get("number")
         if not number:
             return None
-        issue_number = ((pr.get("body") or "") and None) or (
-            (payload.get("issue") or {}).get("number")
-        )
+        issue_number = extract_issue_number(
+            pr.get("body"),
+            pr.get("title"),
+            (pr.get("head") or {}).get("ref"),
+        ) or (payload.get("issue") or {}).get("number")
         action = payload.get("action")
-        login = ((pr.get("user") or {}).get("login")) or ""
-        if action in {"opened", "ready_for_review", "review_requested"}:
-            event_type = (
-                EventType.AGENT_COMPLETED
-                if action in {"ready_for_review", "review_requested"}
-                or pr.get("draft") is False
-                else EventType.PR_OPENED
-            )
-            if action == "opened":
-                event_type = EventType.PR_OPENED
-            if not self._is_coding_agent_login(login) and action == "opened":
-                # PR may still belong to the pipeline job via issue link.
-                event_type = EventType.PR_OPENED
+        if action == "opened":
+            if pr.get("draft"):
+                self._draft_seen.add(number)
             return PipelineEvent(
-                event_id=self._stable_id("pr", number, action),
-                type=event_type,
+                event_id=self._stable_id("pr", number, "opened"),
+                type=EventType.PR_OPENED,
                 issue_number=issue_number,
                 pr_number=number,
-                payload={"html_url": pr.get("html_url") or "", "head_ref": (pr.get("head") or {}).get("ref") or ""},
+                payload={
+                    "html_url": pr.get("html_url") or "",
+                    "head_ref": (pr.get("head") or {}).get("ref") or "",
+                },
+            )
+        if action in {"ready_for_review", "review_requested"}:
+            return PipelineEvent(
+                event_id=self._stable_id("pr", number, action),
+                type=EventType.AGENT_COMPLETED,
+                issue_number=issue_number,
+                pr_number=number,
+                payload={"html_url": pr.get("html_url") or ""},
             )
         return None
 
@@ -290,16 +300,19 @@ class CodingAgentAdapter:
         conclusion = (run.get("conclusion") or "").lower()
         prs = run.get("pull_requests") or []
         pr_number = prs[0]["number"] if prs else None
+        issue_number = extract_issue_number(run.get("head_branch"))
         if conclusion == "success":
             return PipelineEvent(
                 event_id=f"wh-run-success-{run_id}",
                 type=EventType.TESTS_PASSED,
+                issue_number=issue_number,
                 pr_number=pr_number,
             )
         if conclusion in {"failure", "timed_out", "cancelled"}:
             return PipelineEvent(
                 event_id=f"wh-run-failure-{run_id}",
                 type=EventType.TESTS_FAILED,
+                issue_number=issue_number,
                 pr_number=pr_number,
                 error_log=run.get("html_url") or f"workflow run {run_id} failed",
             )

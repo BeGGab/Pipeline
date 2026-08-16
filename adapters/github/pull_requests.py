@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from domain.errors import MergeError
+import httpx
 
 from adapters.github.models import GitHubPullRequest, GitHubUser
+from domain.errors import MergeError
 
 
 class PullRequestsClient:
@@ -53,11 +54,14 @@ class PullRequestsClient:
             f"/repos/{self._owner}/{self._repo}/pulls",
             params={"state": "all", "per_page": 30},
         )
+        marker = f"#{issue_number}"
+        issue_token = str(issue_number)
         return [
             pr
             for pr in (resp.json() or [])
-            if (pr.get("body") or "").find(f"#{issue_number}") >= 0
-            or (pr.get("title") or "").find(f"#{issue_number}") >= 0
+            if marker in (pr.get("body") or "")
+            or marker in (pr.get("title") or "")
+            or issue_token in ((pr.get("head") or {}).get("ref") or "")
         ]
 
     async def get_pull_request_diff(self, pull_request_number: int) -> str:
@@ -78,7 +82,13 @@ class PullRequestsClient:
                 f"/repos/{self._owner}/{self._repo}/pulls/{pull_request_number}/merge",
                 json=payload,
             )
-        except Exception as exc:
-            reason = getattr(getattr(exc, "response", None), "text", None) or str(exc)
+        except httpx.HTTPStatusError as exc:
+            reason = exc.response.text
+            try:
+                reason = exc.response.json().get("message") or reason
+            except Exception:
+                pass
             raise MergeError(reason) from exc
+        except Exception as exc:
+            raise MergeError(str(exc)) from exc
         return resp.json()

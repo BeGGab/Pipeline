@@ -87,14 +87,17 @@ class PipelineRunner:
             self._ensure_watchers(job)
             return
         if job.state == JobState.TEST_PASSED:
-            if job.pr_number:
-                await self.github.run_ai_review(job.pr_number)
-                await self.notifier.send_text(
-                    job.chat_id,
-                    "CI прошёл.\n"
-                    f"PR: {job.pr_url}\n\n"
-                    "Дальше: /diff для ревью или /merge для объединения.",
-                )
+            if job.pipeline_check_posted or not job.pr_number:
+                return
+            job.pipeline_check_posted = True
+            await self.jobs.save(job)
+            await self.github.run_ai_review(job.pr_number)
+            await self.notifier.send_text(
+                job.chat_id,
+                "CI прошёл.\n"
+                f"PR: {job.pr_url}\n\n"
+                "Дальше: /diff для ревью или /merge для объединения.",
+            )
             return
         # CODING_AGENT_RUNNING / WAIT_TESTS: прогресс только через process_event()
 
@@ -153,16 +156,20 @@ class PipelineRunner:
     async def process_event(self, event: PipelineEvent) -> None:
         if event.event_id in self.processed_event_ids:
             return
-        self.processed_event_ids.add(event.event_id)
         job = await self.jobs.find_by_event(event)
-        if job:
-            job.last_event_at = utcnow()
-            await self.jobs.save(job)
-        else:
+        if job is None:
             logger.info("No job for event %s", event.event_id)
             return
+        self.processed_event_ids.add(event.event_id)
+        job.last_event_at = utcnow()
+        self._stale_notified.discard(job.id)
+        await self.jobs.save(job)
 
         if event.type == EventType.AGENT_STARTED:
+            if job.agent_started_notified:
+                return
+            job.agent_started_notified = True
+            await self.jobs.save(job)
             await self.notifier.send_text(
                 job.chat_id,
                 f"Coding agent работает над issue.\n{job.issue_url}",
@@ -180,24 +187,40 @@ class PipelineRunner:
             return
 
         if event.type == EventType.PR_OPENED and event.pr_number:
+            already = job.pr_number == event.pr_number
+            if job.state in (
+                JobState.TEST_PASSED,
+                JobState.MERGE_CONFIRMATION_PENDING,
+                *JobState.terminal(),
+            ):
+                if not job.pr_number:
+                    job.pr_number = event.pr_number
+                    await self.jobs.save(job)
+                return
             job.pr_number = event.pr_number
             job.pr_url = (event.payload or {}).get("html_url") or job.pr_url
             if not job.pr_url:
                 pr = await self.github.get_pull_request(event.pr_number)
                 job.pr_url = pr.html_url
-            job.state = JobState.WAIT_TESTS
+            if job.state in (JobState.TASK_ACCEPTED, JobState.CODING_AGENT_RUNNING):
+                job.state = JobState.WAIT_TESTS
             job.awaiting_user_reply = False
             await self.jobs.save(job)
-            await self.notifier.send_text(
-                job.chat_id,
-                f"Pull Request создан.\n{job.pr_url}",
-            )
+            if not already:
+                await self.notifier.send_text(
+                    job.chat_id,
+                    f"Pull Request создан.\n{job.pr_url}",
+                )
             return
 
         if event.type == EventType.AGENT_COMPLETED:
-            job.awaiting_user_reply = False
             if event.pr_number and not job.pr_number:
                 job.pr_number = event.pr_number
+            job.awaiting_user_reply = False
+            if job.agent_completed_notified:
+                await self.jobs.save(job)
+                return
+            job.agent_completed_notified = True
             await self.jobs.save(job)
             await self.notifier.send_text(
                 job.chat_id,
@@ -207,6 +230,12 @@ class PipelineRunner:
             return
 
         if event.type == EventType.TESTS_PASSED:
+            if job.state in (
+                JobState.TEST_PASSED,
+                JobState.MERGE_CONFIRMATION_PENDING,
+                *JobState.terminal(),
+            ):
+                return
             if event.pr_number:
                 job.pr_number = event.pr_number
             job.state = JobState.TEST_PASSED
@@ -215,6 +244,8 @@ class PipelineRunner:
             return
 
         if event.type == EventType.TESTS_FAILED:
+            if job.state in JobState.terminal():
+                return
             await self._handle_test_failure(job, event.error_log or event.body)
             return
 
@@ -239,7 +270,7 @@ class PipelineRunner:
 
     async def recover_active_jobs(self) -> None:
         for job in await self.jobs.list_non_terminal():
-            if job.state in (JobState.TASK_ACCEPTED, JobState.TEST_PASSED):
+            if job.state == JobState.TASK_ACCEPTED:
                 await self._process_state(job)
             if job.state in (
                 JobState.CODING_AGENT_RUNNING,
@@ -266,7 +297,7 @@ class PipelineRunner:
         except UserFacingError as exc:
             if job is not None:
                 await self.notifier.send_text(job.chat_id, str(exc))
-            raise
+            return
         pr = await self.github.get_pull_request(job.pr_number)
         if pr.merged:
             await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
@@ -320,7 +351,7 @@ class PipelineRunner:
         except UserFacingError as exc:
             if job is not None:
                 await self.notifier.send_text(job.chat_id, str(exc))
-            raise
+            return
         decision = await self._evaluate_merge(job)
         if decision.already_merged:
             await self.notifier.send_text(
@@ -330,6 +361,7 @@ class PipelineRunner:
         if not decision.allowed:
             await self.notifier.send_text(job.chat_id, decision.message)
             return
+        job.state_before_merge = job.state
         job.state = JobState.MERGE_CONFIRMATION_PENDING
         job.merge_head_sha = decision.head_sha
         await self.jobs.save(job)
@@ -347,7 +379,10 @@ class PipelineRunner:
             raise UserFacingError("Задача не найдена.")
         if not confirmed:
             if job.state == JobState.MERGE_CONFIRMATION_PENDING:
-                job.state = JobState.WAIT_TESTS if job.pr_number else job.state
+                job.state = job.state_before_merge or (
+                    JobState.TEST_PASSED if job.pipeline_check_posted else JobState.WAIT_TESTS
+                )
+                job.state_before_merge = None
                 await self.jobs.save(job)
             await self.notifier.send_text(job.chat_id, "Merge отменён.")
             return
@@ -422,7 +457,7 @@ class PipelineRunner:
     async def _fresh_ci_status(self, pr) -> str:
         branch = pr.head_ref
         if not branch:
-            return "success"
+            return "pending"
         runs = await self.github.actions.list_runs_for_branch(branch)
         if not runs:
             latest = await self.github.actions.get_latest_run_for_branch(branch)

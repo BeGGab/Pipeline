@@ -41,13 +41,26 @@ class InMemoryJobRepository:
                 return job.model_copy(deep=True)
         return None
 
+    async def find_waiting_for_pr(self) -> Job | None:
+        matches = [
+            job
+            for job in self._jobs.values()
+            if job.state == JobState.CODING_AGENT_RUNNING and not job.pr_number
+        ]
+        if len(matches) != 1:
+            return None
+        return matches[0].model_copy(deep=True)
+
     async def find_by_event(self, event: PipelineEvent) -> Job | None:
         if event.issue_number is not None:
             found = await self.find_by_issue(event.issue_number)
             if found:
                 return found
         if event.pr_number is not None:
-            return await self.find_by_pr(event.pr_number)
+            found = await self.find_by_pr(event.pr_number)
+            if found:
+                return found
+            return await self.find_waiting_for_pr()
         return None
 
     async def list_non_terminal(self) -> list[Job]:

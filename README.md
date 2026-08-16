@@ -44,7 +44,7 @@ Fill `.env`:
 | Variable | Meaning |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
-| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs. Empty list denies everyone. |
 | `GITHUB_TOKEN` | Fine-grained or classic PAT |
 | `GITHUB_OWNER` / `GITHUB_REPO` | Target repository |
 | `GITHUB_WEBHOOK_SECRET` | Secret for `POST /webhooks/github` |

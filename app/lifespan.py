@@ -16,14 +16,17 @@ from webhooks.router import build_webhook_router
 async def lifespan(app: FastAPI):
     container: AppContainer = app.state.container
     runner = container.runner
+    polling_task = None
+    bot = getattr(app.state, "bot", None)
+    dispatcher = getattr(app.state, "dispatcher", None)
+    if bot is not None and dispatcher is not None:
+        polling_task = asyncio.create_task(dispatcher.start_polling(bot))
+        app.state.polling_task = polling_task
     await runner.recover_active_jobs()
-    polling_task = getattr(app.state, "polling_task", None)
     try:
         yield
     finally:
         runner.cancel_watchers()
-        for task in list(runner._watch_tasks.values()) + list(runner._watchdog_tasks.values()):
-            task.cancel()
         if polling_task is not None:
             polling_task.cancel()
         await container.aclose()
@@ -35,6 +38,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     container = AppContainer(settings, bot=bot)
     app = FastAPI(title="AI Software Pipeline", lifespan=lifespan)
     app.state.container = container
+    app.state.bot = bot
+    app.state.dispatcher = None
     app.state.polling_task = None
     app.include_router(build_webhook_router(container))
 
@@ -45,15 +50,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if bot is not None:
         dp = Dispatcher()
         register_handlers(dp, container.telegram_handlers)
-
-        original_lifespan = app.router.lifespan_context
-
-        @asynccontextmanager
-        async def lifespan_with_polling(app: FastAPI):
-            app.state.polling_task = asyncio.create_task(dp.start_polling(bot))
-            async with original_lifespan(app):
-                yield
-
-        app.router.lifespan_context = lifespan_with_polling
+        app.state.dispatcher = dp
 
     return app

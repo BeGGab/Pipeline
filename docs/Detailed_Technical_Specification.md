@@ -43,7 +43,7 @@ The only production path is `coding_agent.trigger_fix_iteration`.
 
 ### FR-5 Agent completion
 
-Primary signal: PR `draft == false` and/or non-empty `requested_reviewers`. Issue closed and completion-text from the coding-agent login are fallbacks.
+Primary signal: non-empty `requested_reviewers`, or the PR left draft after we already saw it as draft. A PR opened as non-draft without reviewers is not treated as complete. Issue closed and completion-text from the coding-agent login are fallbacks.
 
 ### FR-6 `/diff`
 

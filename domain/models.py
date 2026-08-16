@@ -62,6 +62,10 @@ class Job(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     awaiting_user_reply: bool = False
+    agent_started_notified: bool = False
+    agent_completed_notified: bool = False
+    pipeline_check_posted: bool = False
+    state_before_merge: JobState | None = None
 
 
 class MergeDecision(BaseModel):
