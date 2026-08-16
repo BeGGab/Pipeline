@@ -10,6 +10,8 @@ webhook / watch_issue  →  process_event()  →  Job FSM
 
 `watch_issue` is a reserve for the webhook. Both sources share `process_event` and `processed_event_ids`. There is no second Telegram FSM. Job state is the only process model.
 
+On process start `recover_active_jobs()` reloads jobs from disk, restores processed event IDs, restarts watchers, and tells the operator the service came back. That is separate from BUG-001 (webhook drop inside a live process).
+
 ## Layers
 
 | Layer | Package | Responsibility |
@@ -19,7 +21,7 @@ webhook / watch_issue  →  process_event()  →  Job FSM
 | GitHub adapter | `adapters/github/` | Issues, PRs, comments, Actions, GraphQL assign |
 | Coding agent | `adapters/coding_agent/` | assign, `@copilot` fix, webhook parse, poll |
 | Telegram adapter | `adapters/telegram/` | commands and notifications only |
-| Jobs | `adapters/jobs/` | in-memory store (persistence is out of scope) |
+| Jobs | `adapters/jobs/` | `FileJobRepository` (`JOBS_STORE_PATH`, default `data/jobs.json`); tests use in-memory |
 | HTTP | `app/`, `webhooks/` | FastAPI lifespan, GitHub webhook router |
 
 ## Job states

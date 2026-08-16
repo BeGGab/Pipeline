@@ -193,11 +193,13 @@ class PipelineRunner:
             return
         if job.state in JobState.terminal():
             self.processed_event_ids.add(event.event_id)
+            await self._persist_event_ids()
             return
         self.processed_event_ids.add(event.event_id)
         if len(self.processed_event_ids) > 10_000:
             self.processed_event_ids.clear()
             self.processed_event_ids.add(event.event_id)
+        self._sync_event_ids_to_repo()
         job.last_event_at = utcnow()
         self._stale_notified.discard(job.id)
         self._watch_error_notified.discard(job.id)
@@ -328,7 +330,16 @@ class PipelineRunner:
         await self._enter_terminal(job, JobState.DONE)
 
     async def recover_active_jobs(self) -> None:
+        stored = getattr(self.jobs, "processed_event_ids", None)
+        if stored:
+            self.processed_event_ids |= set(stored)
         for job in await self.jobs.list_non_terminal():
+            if job.issue_number:
+                await self.notifier.send_text(
+                    job.chat_id,
+                    "Сервис перезапущен. Продолжаю следить за задачей.\n"
+                    f"{job.issue_url or job.pr_url}".strip(),
+                )
             if job.state == JobState.TASK_ACCEPTED:
                 await self._process_state(job)
             if job.state in (
@@ -447,11 +458,7 @@ class PipelineRunner:
             return
         if not confirmed:
             if job.state == JobState.MERGE_CONFIRMATION_PENDING:
-                job.state = job.state_before_merge or (
-                    JobState.TEST_PASSED if job.pipeline_check_posted else JobState.WAIT_TESTS
-                )
-                job.state_before_merge = None
-                await self.jobs.save(job)
+                await self._revert_merge_pending(job)
             await self.notifier.send_text(job.chat_id, "Merge отменён.")
             return
         decision = await self._evaluate_merge(job)
@@ -464,9 +471,17 @@ class PipelineRunner:
         if not decision.allowed:
             await self.notifier.send_text(job.chat_id, decision.message)
             return
+        pinned = job.merge_head_sha
+        if pinned and decision.head_sha and pinned != decision.head_sha:
+            await self._revert_merge_pending(job)
+            await self.notifier.send_text(
+                job.chat_id,
+                "PR изменился с момента /merge. Повторите /merge.",
+            )
+            return
         try:
             await self.github.merge_pull_request(
-                job.repository, job.pr_number, sha=decision.head_sha
+                job.repository, job.pr_number, sha=pinned or decision.head_sha
             )
         except MergeError as exc:
             await self.notifier.send_text(
@@ -518,6 +533,25 @@ class PipelineRunner:
             pr_url=pr.html_url,
             ci_label="PASS",
         )
+
+    async def _revert_merge_pending(self, job: Job) -> None:
+        job.state = job.state_before_merge or (
+            JobState.TEST_PASSED if job.pipeline_check_posted else JobState.WAIT_TESTS
+        )
+        job.state_before_merge = None
+        job.merge_head_sha = None
+        await self.jobs.save(job)
+
+    def _sync_event_ids_to_repo(self) -> None:
+        stored = getattr(self.jobs, "processed_event_ids", None)
+        if isinstance(stored, set):
+            stored.clear()
+            stored.update(self.processed_event_ids)
+
+    async def _persist_event_ids(self) -> None:
+        persist = getattr(self.jobs, "replace_processed_event_ids", None)
+        if persist is not None:
+            await persist(self.processed_event_ids)
 
     def _copilot_awaits_user(self, job: Job) -> bool:
         return bool(job.awaiting_user_reply)

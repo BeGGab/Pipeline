@@ -75,7 +75,12 @@ async def test_pr004_confirm_merge_sets_done(harness):
         harness["runner"],
         harness["notifier"],
     )
-    job = await seed_job(jobs, state=JobState.MERGE_CONFIRMATION_PENDING)
+    job = await seed_job(
+        jobs,
+        state=JobState.MERGE_CONFIRMATION_PENDING,
+        merge_head_sha="abc123",
+        state_before_merge=JobState.WAIT_TESTS,
+    )
     store.prs[12] = open_pr()
     store.runs["copilot/fix-12"] = [
         {"id": 1, "status": "completed", "conclusion": "success"}
@@ -169,7 +174,12 @@ async def test_pr009_telegram_document_failure_does_not_change_job(harness):
 
 async def test_pr010_github_merge_failure_does_not_mark_done(harness):
     jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
-    job = await seed_job(jobs, state=JobState.MERGE_CONFIRMATION_PENDING)
+    job = await seed_job(
+        jobs,
+        state=JobState.MERGE_CONFIRMATION_PENDING,
+        merge_head_sha="abc123",
+        state_before_merge=JobState.WAIT_TESTS,
+    )
     store.prs[12] = open_pr()
     store.runs["copilot/fix-12"] = [
         {"id": 1, "status": "completed", "conclusion": "success"}

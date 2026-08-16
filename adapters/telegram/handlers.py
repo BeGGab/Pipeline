@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from config.settings import Settings
 from domain.errors import UserFacingError
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -106,22 +110,46 @@ class TelegramHandlers:
         parts = data.split(":")
         confirmed = len(parts) >= 2 and parts[1] == "confirm"
         job_id = parts[2] if len(parts) >= 3 else ""
-        if not job_id and callback.message:
-            job_id = await self._job_id_for_chat(callback.message.chat.id)
-        job = await self.jobs.get(job_id) if job_id else None
-        chat_id = callback.message.chat.id if callback.message else None
-        if job is None or (chat_id is not None and job.chat_id != chat_id):
-            await callback.answer("Нет доступа.", show_alert=True)
-            return
-        if job.user_id and user_id is not None and job.user_id != user_id:
-            await callback.answer("Нет доступа.", show_alert=True)
-            return
+        answered = False
         try:
+            if not job_id and callback.message:
+                job_id = await self._job_id_for_chat(callback.message.chat.id)
+            job = await self.jobs.get(job_id) if job_id else None
+            chat_id = callback.message.chat.id if callback.message else None
+            if job is None or (chat_id is not None and job.chat_id != chat_id):
+                await callback.answer("Нет доступа.", show_alert=True)
+                answered = True
+                return
+            if job.user_id and user_id is not None and job.user_id != user_id:
+                await callback.answer("Нет доступа.", show_alert=True)
+                answered = True
+                return
             await self.orchestrator.confirm_merge(job_id, confirmed)
         except UserFacingError as exc:
-            if callback.message:
-                await callback.message.answer(str(exc))
-        await callback.answer()
+            try:
+                await callback.answer(str(exc)[:180], show_alert=True)
+                answered = True
+            except Exception:
+                if callback.message:
+                    await callback.message.answer(str(exc))
+        except Exception:
+            logger.exception("merge callback failed")
+            try:
+                await callback.answer(
+                    "Не удалось обработать подтверждение.", show_alert=True
+                )
+                answered = True
+            except Exception:
+                if callback.message:
+                    await callback.message.answer(
+                        "Не удалось обработать подтверждение."
+                    )
+        finally:
+            if not answered:
+                try:
+                    await callback.answer()
+                except Exception:
+                    pass
 
 
 def register_handlers(dp, handlers: TelegramHandlers) -> None:

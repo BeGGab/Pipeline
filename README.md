@@ -49,6 +49,7 @@ Fill `.env`:
 | `GITHUB_OWNER` / `GITHUB_REPO` | Target repository |
 | `GITHUB_WEBHOOK_SECRET` | Secret for `POST /webhooks/github` |
 | `COPILOT_USERNAME` | `copilot-swe-agent[bot]` |
+| `JOBS_STORE_PATH` | JSON file for jobs + processed event IDs. Empty = in-memory only. |
 
 Point a GitHub webhook at `https://<host>/webhooks/github` for `issues`, `issue_comment`, `pull_request`, `workflow_run`. Polling still works if the webhook is missing.
 
@@ -71,12 +72,12 @@ python -m app.main
 pytest
 ```
 
-Covers BUG-001…009 and PR-001…PR-010 (`TEST-015+`).
+Covers BUG-001…009, PR-001…PR-013, and process-restart persistence (`TEST-015+`).
 
 ## Layout
 
 ```
-adapters/     GitHub, Telegram, coding agent, in-memory jobs
+adapters/     GitHub, Telegram, coding agent, file/in-memory jobs
 orchestrator/ Job FSM, watchers, /diff, /merge
 ports/        Protocols — Telegram does not import GitHub
 webhooks/     Signature check → parse_webhook_event

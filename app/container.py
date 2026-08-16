@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from adapters.coding_agent.adapter import CodingAgentAdapter
 from adapters.github.adapter import GitHubAdapter
+from adapters.jobs.file_store import FileJobRepository
 from adapters.jobs.memory import InMemoryJobRepository
 from adapters.telegram.handlers import TelegramHandlers
 from adapters.telegram.notifier import TelegramNotifier
@@ -12,7 +13,11 @@ from orchestrator.pipeline_runner import PipelineRunner
 class AppContainer:
     def __init__(self, settings: Settings, *, bot=None) -> None:
         self.settings = settings
-        self.jobs = InMemoryJobRepository()
+        self.jobs = (
+            FileJobRepository(settings.jobs_store_path)
+            if settings.jobs_store_path
+            else InMemoryJobRepository()
+        )
         self.github = GitHubAdapter(settings)
         self.coding_agent = CodingAgentAdapter(self.github, settings)
         self.notifier = TelegramNotifier(bot) if bot is not None else _NullNotifier()
