@@ -30,10 +30,20 @@ class PipelineRunner:
         self._watch_tasks: dict[str, asyncio.Task] = {}
         self._watchdog_tasks: dict[str, asyncio.Task] = {}
         self._stale_notified: set[str] = set()
+        self._watch_error_notified: set[str] = set()
 
     async def start_job(
         self, *, chat_id: int, user_id: int, title: str, body: str
     ) -> Job:
+        previous = await self.jobs.find_by_chat(chat_id)
+        if previous is not None and previous.state not in JobState.terminal():
+            previous.state = JobState.FAILED
+            await self.jobs.save(previous)
+            self._stop_job_watchers(previous.id)
+            await self.notifier.send_text(
+                chat_id,
+                "Предыдущая задача остановлена: запущена новая.",
+            )
         job = Job(
             chat_id=chat_id,
             user_id=user_id,
@@ -55,29 +65,31 @@ class PipelineRunner:
         return body.rstrip() + extra
 
     async def trigger_coding_agent(self, job: Job) -> None:
-        issue = await self.github.create_issue(job.title, job.body)
-        job.issue_number = issue["number"]
-        job.issue_url = issue.get("html_url") or ""
-        await self.jobs.save(job)
+        created_now = False
+        if not job.issue_number:
+            issue = await self.github.create_issue(job.title, job.body)
+            job.issue_number = issue["number"]
+            job.issue_url = issue.get("html_url") or ""
+            await self.jobs.save(job)
+            created_now = True
         await self.coding_agent.trigger(job.issue_number)
-        await self.notifier.send_text(
-            job.chat_id,
-            f"Задача принята. Issue: {job.issue_url}\n"
-            "Coding agent назначен и начал работу.",
-        )
+        if created_now:
+            await self.notifier.send_text(
+                job.chat_id,
+                f"Задача принята. Issue: {job.issue_url}\n"
+                "Coding agent назначен и начал работу.",
+            )
 
     async def _process_state(self, job: Job) -> None:
         if job.state == JobState.TASK_ACCEPTED:
             try:
                 await self.trigger_coding_agent(job)
             except AssignmentError as exc:
-                job.state = JobState.ADAPTER_ERROR
-                await self.jobs.save(job)
+                await self._enter_terminal(job, JobState.ADAPTER_ERROR)
                 await self.notifier.send_text(job.chat_id, str(exc))
                 return
             except Exception as exc:
-                job.state = JobState.ADAPTER_ERROR
-                await self.jobs.save(job)
+                await self._enter_terminal(job, JobState.ADAPTER_ERROR)
                 await self.notifier.send_text(
                     job.chat_id, f"Не удалось запустить задачу: {exc}"
                 )
@@ -91,7 +103,10 @@ class PipelineRunner:
                 return
             job.pipeline_check_posted = True
             await self.jobs.save(job)
-            await self.github.run_ai_review(job.pr_number)
+            try:
+                await self.github.run_ai_review(job.pr_number)
+            except Exception as exc:
+                logger.warning("pipeline check comment failed: %s", exc)
             await self.notifier.send_text(
                 job.chat_id,
                 "CI прошёл.\n"
@@ -115,23 +130,39 @@ class PipelineRunner:
                 name=f"stale-watchdog-{job.id}",
             )
 
+    def _stop_job_watchers(self, job_id: str) -> None:
+        for bucket in (self._watch_tasks, self._watchdog_tasks):
+            task = bucket.pop(job_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+
+    async def _enter_terminal(self, job: Job, state: JobState) -> None:
+        job.state = state
+        await self.jobs.save(job)
+        self._stop_job_watchers(job.id)
+
     async def _run_watch_issue(self, job: Job) -> None:
         if not job.issue_number:
             return
-        try:
-            async for event in self.coding_agent.watch_issue(job.issue_number):
-                fresh = await self.jobs.get(job.id)
-                if fresh is None or fresh.state in JobState.terminal():
-                    return
-                await self.process_event(event)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self.notifier.send_text(
-                job.chat_id,
-                f"Ошибка резервного опроса GitHub: {exc}\n"
-                f"Проверьте issue вручную: {job.issue_url}",
-            )
+        while True:
+            try:
+                async for event in self.coding_agent.watch_issue(job.issue_number):
+                    fresh = await self.jobs.get(job.id)
+                    if fresh is None or fresh.state in JobState.terminal():
+                        return
+                    await self.process_event(event)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if job.id not in self._watch_error_notified:
+                    await self.notifier.send_text(
+                        job.chat_id,
+                        f"Ошибка резервного опроса GitHub: {exc}\n"
+                        f"Проверьте issue вручную: {job.issue_url}",
+                    )
+                    self._watch_error_notified.add(job.id)
+                await asyncio.sleep(self.settings.coding_agent_poll_interval_sec)
 
     async def _run_stale_watchdog(self, job: Job) -> None:
         timeout = self.settings.coding_agent_stale_timeout_sec
@@ -160,13 +191,22 @@ class PipelineRunner:
         if job is None:
             logger.info("No job for event %s", event.event_id)
             return
+        if job.state in JobState.terminal():
+            self.processed_event_ids.add(event.event_id)
+            return
         self.processed_event_ids.add(event.event_id)
+        if len(self.processed_event_ids) > 10_000:
+            self.processed_event_ids.clear()
+            self.processed_event_ids.add(event.event_id)
         job.last_event_at = utcnow()
         self._stale_notified.discard(job.id)
+        self._watch_error_notified.discard(job.id)
         await self.jobs.save(job)
 
         if event.type == EventType.AGENT_STARTED:
+            job.awaiting_user_reply = False
             if job.agent_started_notified:
+                await self.jobs.save(job)
                 return
             job.agent_started_notified = True
             await self.jobs.save(job)
@@ -246,10 +286,16 @@ class PipelineRunner:
         if event.type == EventType.TESTS_FAILED:
             if job.state in JobState.terminal():
                 return
+            job.awaiting_user_reply = False
+            await self.jobs.save(job)
             await self._handle_test_failure(job, event.error_log or event.body)
             return
 
         if event.type == EventType.ISSUE_CLOSED and job.state not in JobState.terminal():
+            if job.issue_closed_notified:
+                return
+            job.issue_closed_notified = True
+            await self.jobs.save(job)
             await self.notifier.send_text(
                 job.chat_id,
                 f"Issue закрыт.\n{job.issue_url}",
@@ -259,7 +305,15 @@ class PipelineRunner:
         # BUG-002 + BUG-003: единственный путь — подтверждённая команда @copilot
         if not job.issue_number:
             return
-        await self.coding_agent.trigger_fix_iteration(job.issue_number, error_log)
+        try:
+            await self.coding_agent.trigger_fix_iteration(job.issue_number, error_log)
+        except Exception as exc:
+            await self.notifier.send_text(
+                job.chat_id,
+                f"Не удалось отправить @copilot Fix the failing tests: {exc}\n"
+                f"{job.issue_url}",
+            )
+            return
         job.state = JobState.CODING_AGENT_RUNNING
         await self.jobs.save(job)
         await self.notifier.send_text(
@@ -268,6 +322,11 @@ class PipelineRunner:
             f"{job.issue_url}",
         )
 
+    async def _mark_observed_merged(self, job: Job) -> None:
+        if job.state in JobState.terminal():
+            return
+        await self._enter_terminal(job, JobState.DONE)
+
     async def recover_active_jobs(self) -> None:
         for job in await self.jobs.list_non_terminal():
             if job.state == JobState.TASK_ACCEPTED:
@@ -275,13 +334,14 @@ class PipelineRunner:
             if job.state in (
                 JobState.CODING_AGENT_RUNNING,
                 JobState.WAIT_TESTS,
+                JobState.TEST_PASSED,
                 JobState.MERGE_CONFIRMATION_PENDING,
             ):
                 self._ensure_watchers(job)
 
     def cancel_watchers(self) -> None:
-        for task in list(self._watch_tasks.values()) + list(self._watchdog_tasks.values()):
-            task.cancel()
+        for job_id in list(self._watch_tasks) + list(self._watchdog_tasks):
+            self._stop_job_watchers(job_id)
 
     def _bound_pr(self, job: Job | None) -> Job:
         if job is None:
@@ -300,6 +360,7 @@ class PipelineRunner:
             return
         pr = await self.github.get_pull_request(job.pr_number)
         if pr.merged:
+            await self._mark_observed_merged(job)
             await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
             return
         if pr.state == "closed":
@@ -354,6 +415,7 @@ class PipelineRunner:
             return
         decision = await self._evaluate_merge(job)
         if decision.already_merged:
+            await self._mark_observed_merged(job)
             await self.notifier.send_text(
                 job.chat_id, f"PR #{job.pr_number} уже объединён."
             )
@@ -377,6 +439,12 @@ class PipelineRunner:
         job = await self.jobs.get(job_id)
         if job is None:
             raise UserFacingError("Задача не найдена.")
+        if confirmed and job.state != JobState.MERGE_CONFIRMATION_PENDING:
+            await self.notifier.send_text(
+                job.chat_id,
+                "Сначала отправьте /merge и подтвердите кнопкой.",
+            )
+            return
         if not confirmed:
             if job.state == JobState.MERGE_CONFIRMATION_PENDING:
                 job.state = job.state_before_merge or (
@@ -388,6 +456,7 @@ class PipelineRunner:
             return
         decision = await self._evaluate_merge(job)
         if decision.already_merged:
+            await self._mark_observed_merged(job)
             await self.notifier.send_text(
                 job.chat_id, f"PR #{job.pr_number} уже объединён."
             )
@@ -406,8 +475,7 @@ class PipelineRunner:
                 f"Причина: {exc.reason}",
             )
             return
-        job.state = JobState.DONE
-        await self.jobs.save(job)
+        await self._enter_terminal(job, JobState.DONE)
         await self.notifier.send_text(
             job.chat_id,
             f"PR #{job.pr_number} успешно объединён.\n\n"

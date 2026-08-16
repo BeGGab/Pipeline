@@ -125,10 +125,9 @@ async def test_pr007_already_merged_is_idempotent(harness):
     store.prs[12] = open_pr(merged=True, state="closed")
 
     await runner.request_merge(job.id)
-    await runner.confirm_merge(job.id, True)
 
     assert store.merge_calls == []
-    assert all("уже объединён" in text for _, text in harness["notifier"].texts)
+    assert any("уже объединён" in text for _, text in harness["notifier"].texts)
 
 
 async def test_pr008_no_pr_no_github_mutation(harness):

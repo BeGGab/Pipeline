@@ -65,6 +65,7 @@ class Job(BaseModel):
     agent_started_notified: bool = False
     agent_completed_notified: bool = False
     pipeline_check_posted: bool = False
+    issue_closed_notified: bool = False
     state_before_merge: JobState | None = None
 
 

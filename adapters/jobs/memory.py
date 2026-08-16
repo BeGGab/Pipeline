@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from domain.clock import utcnow
-from domain.models import Job, JobState, PipelineEvent
+from domain.models import EventType, Job, JobState, PipelineEvent
 
 
 class InMemoryJobRepository:
@@ -29,17 +29,22 @@ class InMemoryJobRepository:
         latest = max(matches, key=lambda item: item.updated_at)
         return latest.model_copy(deep=True)
 
+    def _pick(self, matches: list[Job]) -> Job | None:
+        if not matches:
+            return None
+        live = [job for job in matches if job.state not in JobState.terminal()]
+        chosen = max(live or matches, key=lambda item: item.updated_at)
+        return chosen.model_copy(deep=True)
+
     async def find_by_issue(self, issue_number: int) -> Job | None:
-        for job in self._jobs.values():
-            if job.issue_number == issue_number:
-                return job.model_copy(deep=True)
-        return None
+        return self._pick(
+            [job for job in self._jobs.values() if job.issue_number == issue_number]
+        )
 
     async def find_by_pr(self, pr_number: int) -> Job | None:
-        for job in self._jobs.values():
-            if job.pr_number == pr_number:
-                return job.model_copy(deep=True)
-        return None
+        return self._pick(
+            [job for job in self._jobs.values() if job.pr_number == pr_number]
+        )
 
     async def find_waiting_for_pr(self) -> Job | None:
         matches = [
@@ -60,6 +65,11 @@ class InMemoryJobRepository:
             found = await self.find_by_pr(event.pr_number)
             if found:
                 return found
+        if event.issue_number is not None:
+            return None
+        if event.type == EventType.PR_OPENED:
+            return None
+        if event.pr_number is not None:
             return await self.find_waiting_for_pr()
         return None
 

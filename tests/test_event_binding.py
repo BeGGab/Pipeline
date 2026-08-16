@@ -69,7 +69,7 @@ async def test_unknown_event_is_not_consumed(harness):
     assert "orphan" not in runner.processed_event_ids
 
 
-async def test_pr_without_issue_binds_lone_running_job(harness):
+async def test_pr_without_issue_does_not_bind_lone_running_job(harness):
     jobs, runner = harness["jobs"], harness["runner"]
     job = await seed_job(jobs, state=JobState.CODING_AGENT_RUNNING, pr_number=None)
     await runner.process_event(
@@ -81,8 +81,8 @@ async def test_pr_without_issue_binds_lone_running_job(harness):
         )
     )
     fresh = await jobs.get(job.id)
-    assert fresh.pr_number == 12
-    assert fresh.state == JobState.WAIT_TESTS
+    assert fresh.pr_number is None
+    assert fresh.state == JobState.CODING_AGENT_RUNNING
 
 
 async def test_recover_does_not_repost_pipeline_check(harness):

@@ -30,6 +30,8 @@ def build_webhook_router(container) -> APIRouter:
     ):
         body = await request.body()
         settings = container.settings
+        if not (settings.github_webhook_secret or "").strip():
+            raise HTTPException(status_code=503, detail="webhook secret is not configured")
         if not verify_signature(settings.github_webhook_secret, body, x_hub_signature_256):
             raise HTTPException(status_code=401, detail="invalid signature")
         try:

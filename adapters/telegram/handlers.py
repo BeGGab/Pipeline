@@ -32,6 +32,9 @@ class TelegramHandlers:
         return job.id
 
     async def on_start(self, message: Message) -> None:
+        if not _authorized(message.from_user.id if message.from_user else None, self.settings):
+            await message.answer("Нет доступа.")
+            return
         await message.answer(
             "AI Software Pipeline\n\n"
             "/new <задача> — создать Issue и назначить Copilot\n"
@@ -79,6 +82,9 @@ class TelegramHandlers:
             await message.answer(str(exc))
 
     async def on_status(self, message: Message) -> None:
+        if not _authorized(message.from_user.id if message.from_user else None, self.settings):
+            await message.answer("Нет доступа.")
+            return
         job = await self.jobs.find_by_chat(message.chat.id)
         if job is None:
             await message.answer("Нет задач.")
@@ -102,6 +108,14 @@ class TelegramHandlers:
         job_id = parts[2] if len(parts) >= 3 else ""
         if not job_id and callback.message:
             job_id = await self._job_id_for_chat(callback.message.chat.id)
+        job = await self.jobs.get(job_id) if job_id else None
+        chat_id = callback.message.chat.id if callback.message else None
+        if job is None or (chat_id is not None and job.chat_id != chat_id):
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
+        if job.user_id and user_id is not None and job.user_id != user_id:
+            await callback.answer("Нет доступа.", show_alert=True)
+            return
         try:
             await self.orchestrator.confirm_merge(job_id, confirmed)
         except UserFacingError as exc:

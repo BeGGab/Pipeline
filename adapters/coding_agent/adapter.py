@@ -12,13 +12,15 @@ from config.settings import Settings
 from domain.models import EventType, PipelineEvent
 
 _FIX_TRIGGER_TEXT = "@copilot Fix the failing tests"
+_MAX_FIX_LOG_CHARS = 12_000
 
 _COMPLETION_RE = re.compile(
     r"(task (is )?complete|ready for review|i('ve| have) completed)",
     re.IGNORECASE,
 )
 _QUESTION_RE = re.compile(
-    r"(\?|please (confirm|clarify|choose)|waiting for (your )?(reply|answer))",
+    r"(please (confirm|clarify|choose|reply)|waiting for (your )?(reply|answer)|"
+    r"could you|which (option|approach))",
     re.IGNORECASE,
 )
 
@@ -40,7 +42,10 @@ class CodingAgentAdapter:
         await self.github.issues.assign_copilot(issue_number)
 
     async def trigger_fix_iteration(self, issue_number: int, error_log: str) -> None:
-        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{error_log.strip()}\n```"
+        log = (error_log or "").strip()
+        if len(log) > _MAX_FIX_LOG_CHARS:
+            log = log[:_MAX_FIX_LOG_CHARS] + "\n...[truncated]"
+        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{log}\n```"
         await self.github.comments.create_issue_comment(issue_number, body)
 
     async def detect_task_completion(
@@ -163,14 +168,13 @@ class CodingAgentAdapter:
                     issue_number=issue_number,
                     pr_number=pr_number,
                 )
-            elif conclusion in {"failure", "timed_out", "cancelled"}:
-                logs = await self.github.actions.get_run_logs(run_id)
+            elif conclusion in {"failure", "timed_out"}:
                 yield PipelineEvent(
                     event_id=f"run-failure-{run_id}",
                     type=EventType.TESTS_FAILED,
                     issue_number=issue_number,
                     pr_number=pr_number,
-                    error_log=logs,
+                    error_log=run.get("html_url") or f"workflow run {run_id} failed",
                 )
 
     def _event_from_comment(
@@ -227,7 +231,7 @@ class CodingAgentAdapter:
             return None
         if name == "issues" and payload.get("action") == "closed":
             return PipelineEvent(
-                event_id=self._stable_id("issue-closed", issue_number, payload.get("action")),
+                event_id=f"issue-closed-{issue_number}",
                 type=EventType.ISSUE_CLOSED,
                 issue_number=issue_number,
             )
@@ -239,20 +243,20 @@ class CodingAgentAdapter:
         cid = comment.get("id") or self._stable_id(issue_number, body)
         if self._looks_like_completion_text(body):
             return PipelineEvent(
-                event_id=f"wh-comment-complete-{cid}",
+                event_id=f"comment-complete-{cid}",
                 type=EventType.AGENT_COMPLETED,
                 issue_number=issue_number,
                 body=body,
             )
         if self._looks_like_question(body):
             return PipelineEvent(
-                event_id=f"wh-comment-question-{cid}",
+                event_id=f"comment-question-{cid}",
                 type=EventType.COPILOT_QUESTION,
                 issue_number=issue_number,
                 body=body,
             )
         return PipelineEvent(
-            event_id=f"wh-comment-started-{cid}",
+            event_id=f"comment-started-{cid}",
             type=EventType.AGENT_STARTED,
             issue_number=issue_number,
             body=body,
@@ -273,7 +277,7 @@ class CodingAgentAdapter:
             if pr.get("draft"):
                 self._draft_seen.add(number)
             return PipelineEvent(
-                event_id=self._stable_id("pr", number, "opened"),
+                event_id=f"pr-opened-{number}",
                 type=EventType.PR_OPENED,
                 issue_number=issue_number,
                 pr_number=number,
@@ -284,7 +288,7 @@ class CodingAgentAdapter:
             )
         if action in {"ready_for_review", "review_requested"}:
             return PipelineEvent(
-                event_id=self._stable_id("pr", number, action),
+                event_id=f"agent-completed-{number}",
                 type=EventType.AGENT_COMPLETED,
                 issue_number=issue_number,
                 pr_number=number,
@@ -303,14 +307,14 @@ class CodingAgentAdapter:
         issue_number = extract_issue_number(run.get("head_branch"))
         if conclusion == "success":
             return PipelineEvent(
-                event_id=f"wh-run-success-{run_id}",
+                event_id=f"run-success-{run_id}",
                 type=EventType.TESTS_PASSED,
                 issue_number=issue_number,
                 pr_number=pr_number,
             )
-        if conclusion in {"failure", "timed_out", "cancelled"}:
+        if conclusion in {"failure", "timed_out"}:
             return PipelineEvent(
-                event_id=f"wh-run-failure-{run_id}",
+                event_id=f"run-failure-{run_id}",
                 type=EventType.TESTS_FAILED,
                 issue_number=issue_number,
                 pr_number=pr_number,

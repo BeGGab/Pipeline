@@ -58,9 +58,18 @@ class FakeGitHub:
         self.store = store
         self.actions = self
         self.review_comments: list[str] = []
+        self.created_issues: list[dict] = []
 
     async def create_issue(self, title: str, body: str) -> dict:
-        return {"number": 1, "html_url": "https://github.com/acme/repo/issues/1"}
+        number = len(self.created_issues) + 1
+        issue = {
+            "number": number,
+            "html_url": f"https://github.com/acme/repo/issues/{number}",
+            "title": title,
+            "body": body,
+        }
+        self.created_issues.append(issue)
+        return issue
 
     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
         return self.store.prs[pull_request_number]
