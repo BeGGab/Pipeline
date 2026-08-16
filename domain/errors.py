@@ -10,3 +10,7 @@ class MergeError(UserFacingError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class GitHubUnavailableError(Exception):
+    """Transport or API failure talking to GitHub — not an application bug."""

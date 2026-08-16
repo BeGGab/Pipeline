@@ -7,7 +7,7 @@ import pytest
 from adapters.github.models import GitHubPullRequest, GitHubUser
 from adapters.jobs.memory import InMemoryJobRepository
 from config.settings import Settings
-from domain.errors import MergeError
+from domain.errors import GitHubUnavailableError, MergeError
 from domain.models import Job, JobState
 from orchestrator.pipeline_runner import PipelineRunner
 
@@ -74,7 +74,7 @@ class FakeGitHub:
 
     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
         if self.store.fail_get_pr:
-            raise RuntimeError("github unavailable")
+            raise GitHubUnavailableError("github unavailable")
         return self.store.prs[pull_request_number]
 
     async def get_pull_request_diff(
@@ -82,7 +82,7 @@ class FakeGitHub:
     ) -> str:
         self.store.diff_calls.append(pull_request_number)
         if self.store.fail_diff:
-            raise RuntimeError("github unavailable")
+            raise GitHubUnavailableError("github unavailable")
         return self.store.diffs.get(pull_request_number, "")
 
     async def merge_pull_request(
@@ -160,6 +160,7 @@ def settings() -> Settings:
     return Settings(
         github_owner="acme",
         github_repo="repo",
+        telegram_allowed_user_ids="7",
         telegram_max_document_bytes=50 * 1024 * 1024,
         coding_agent_stale_timeout_sec=1800,
     )

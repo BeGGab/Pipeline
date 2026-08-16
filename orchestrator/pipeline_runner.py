@@ -3,10 +3,24 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
+
 from config.settings import Settings
 from domain.clock import utcnow
-from domain.errors import AssignmentError, MergeError, UserFacingError
+from domain.errors import (
+    AssignmentError,
+    GitHubUnavailableError,
+    MergeError,
+    UserFacingError,
+)
 from domain.models import EventType, Job, JobState, MergeDecision, PipelineEvent
+
+_GITHUB_TRANSPORT = (
+    GitHubUnavailableError,
+    httpx.HTTPError,
+    TimeoutError,
+    ConnectionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -371,11 +385,18 @@ class PipelineRunner:
             return
         try:
             pr = await self.github.get_pull_request(job.pr_number)
-        except Exception:
+        except _GITHUB_TRANSPORT:
             await self.notifier.send_text(
                 job.chat_id,
                 "Не удалось получить diff Pull Request.\n"
                 "Попробуйте повторить команду позже.",
+            )
+            return
+        except Exception:
+            logger.exception("unexpected error loading PR for /diff")
+            await self.notifier.send_text(
+                job.chat_id,
+                "Внутренняя ошибка при получении diff. Попробуйте позже.",
             )
             return
         if pr.merged:
@@ -389,11 +410,18 @@ class PipelineRunner:
             return
         try:
             diff = await self.github.get_pull_request_diff(job.repository, job.pr_number)
-        except Exception:
+        except _GITHUB_TRANSPORT:
             await self.notifier.send_text(
                 job.chat_id,
                 "Не удалось получить diff Pull Request.\n"
                 "Попробуйте повторить команду позже.",
+            )
+            return
+        except Exception:
+            logger.exception("unexpected error fetching PR diff")
+            await self.notifier.send_text(
+                job.chat_id,
+                "Внутренняя ошибка при получении diff. Попробуйте позже.",
             )
             return
         if not (diff or "").strip():
@@ -407,6 +435,7 @@ class PipelineRunner:
             await self.notifier.send_text(
                 job.chat_id,
                 "Diff сформирован, но его размер превышает лимит Telegram.\n\n"
+                f"Полный diff: {pr.html_url}.diff\n"
                 f"PR: {pr.html_url}",
             )
             return
@@ -434,11 +463,18 @@ class PipelineRunner:
             return
         try:
             decision = await self._evaluate_merge(job)
-        except Exception:
+        except _GITHUB_TRANSPORT:
             await self.notifier.send_text(
                 job.chat_id,
                 "Не удалось проверить состояние Pull Request.\n"
                 "Попробуйте повторить команду позже.",
+            )
+            return
+        except Exception:
+            logger.exception("unexpected error evaluating /merge")
+            await self.notifier.send_text(
+                job.chat_id,
+                "Внутренняя ошибка при проверке Pull Request. Попробуйте позже.",
             )
             return
         if decision.already_merged:
@@ -462,7 +498,15 @@ class PipelineRunner:
             f"Объединить Pull Request?",
         )
 
-    async def confirm_merge(self, job_id: str, confirmed: bool) -> None:
+    def _require_operator(self, operator_id: int | None) -> None:
+        allowed = self.settings.allowed_user_ids
+        if not allowed or operator_id not in allowed:
+            raise UserFacingError("Нет доступа.")
+
+    async def confirm_merge(
+        self, job_id: str, confirmed: bool, *, operator_id: int | None
+    ) -> None:
+        self._require_operator(operator_id)
         job = await self.jobs.get(job_id)
         if job is None:
             raise UserFacingError("Задача не найдена.")
@@ -479,11 +523,18 @@ class PipelineRunner:
             return
         try:
             decision = await self._evaluate_merge(job)
-        except Exception:
+        except _GITHUB_TRANSPORT:
             await self.notifier.send_text(
                 job.chat_id,
                 "Не удалось проверить состояние Pull Request.\n"
                 "Попробуйте повторить команду позже.",
+            )
+            return
+        except Exception:
+            logger.exception("unexpected error evaluating confirm_merge")
+            await self.notifier.send_text(
+                job.chat_id,
+                "Внутренняя ошибка при проверке Pull Request. Попробуйте позже.",
             )
             return
         if decision.already_merged:
@@ -503,6 +554,7 @@ class PipelineRunner:
                 "PR изменился с момента /merge. Повторите /merge.",
             )
             return
+        self._require_operator(operator_id)
         try:
             await self.github.merge_pull_request(
                 job.repository, job.pr_number, sha=pinned or decision.head_sha

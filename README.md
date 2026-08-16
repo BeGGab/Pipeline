@@ -70,8 +70,8 @@ python -m app.main
 | Command | Effect |
 | --- | --- |
 | `/new <text>` | Create issue, assign Copilot |
-| `/diff` | Live unified diff of the current job PR as `PR-{n}.diff` |
-| `/merge` | Status + Merge/Cancel for the current job PR only (`/merge 123` is ignored) |
+| `/diff` | Live unified diff of the current job PR as `PR-{n}.diff`. A PR number is rejected. |
+| `/merge` | Status + Merge/Cancel for the current job PR. `/merge 123` is rejected. Confirm re-checks the allowlist. |
 | `/status` | Current job state |
 
 ## Tests
@@ -80,7 +80,7 @@ python -m app.main
 pytest
 ```
 
-Covers BUG-001…009 and PIPE-PR-001 (`TEST-015+`, PR-001…PR-024).
+Covers BUG-001…009 and PIPE-PR-001 (`TEST-015+`, PR-001…PR-028).
 
 ## Layout
 

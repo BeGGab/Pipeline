@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
@@ -12,6 +13,17 @@ from domain.errors import UserFacingError
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+_COMMAND_ARGS_RE = re.compile(r"^/\w+(?:@\w+)?(?:\s+|$)(.*)$", re.DOTALL)
+
+
+def _command_args(text: str | None) -> str:
+    raw = (text or "").strip()
+    match = _COMMAND_ARGS_RE.match(raw)
+    if match:
+        return match.group(1).strip()
+    parts = raw.split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
 def _authorized(user_id: int | None, settings: Settings) -> bool:
@@ -51,7 +63,7 @@ class TelegramHandlers:
         if not _authorized(message.from_user.id if message.from_user else None, self.settings):
             await message.answer("Нет доступа.")
             return
-        text = (message.text or "").partition(" ")[2].strip()
+        text = _command_args(message.text)
         if not text and message.reply_to_message:
             text = (message.reply_to_message.text or "").strip()
         if not text:
@@ -65,9 +77,22 @@ class TelegramHandlers:
             body=text,
         )
 
+    def _reject_pr_number_arg(self, message: Message, command: str) -> str | None:
+        extra = _command_args(message.text)
+        if not extra:
+            return None
+        return (
+            f"Команда {command} не принимает номер PR.\n"
+            "Используется Pull Request текущей задачи."
+        )
+
     async def on_diff(self, message: Message) -> None:
         if not _authorized(message.from_user.id if message.from_user else None, self.settings):
             await message.answer("Нет доступа.")
+            return
+        hint = self._reject_pr_number_arg(message, "/diff")
+        if hint:
+            await message.answer(hint)
             return
         try:
             job_id = await self._job_id_for_chat(message.chat.id)
@@ -78,6 +103,10 @@ class TelegramHandlers:
     async def on_merge(self, message: Message) -> None:
         if not _authorized(message.from_user.id if message.from_user else None, self.settings):
             await message.answer("Нет доступа.")
+            return
+        hint = self._reject_pr_number_arg(message, "/merge")
+        if hint:
+            await message.answer(hint)
             return
         try:
             job_id = await self._job_id_for_chat(message.chat.id)
@@ -120,11 +149,9 @@ class TelegramHandlers:
                 await callback.answer("Нет доступа.", show_alert=True)
                 answered = True
                 return
-            if job.user_id and user_id is not None and job.user_id != user_id:
-                await callback.answer("Нет доступа.", show_alert=True)
-                answered = True
-                return
-            await self.orchestrator.confirm_merge(job_id, confirmed)
+            await self.orchestrator.confirm_merge(
+                job_id, confirmed, operator_id=user_id
+            )
         except UserFacingError as exc:
             try:
                 await callback.answer(str(exc)[:180], show_alert=True)

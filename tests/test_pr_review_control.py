@@ -86,7 +86,7 @@ async def test_pr004_confirm_merge_sets_done(harness):
         {"id": 1, "status": "completed", "conclusion": "success"}
     ]
 
-    await runner.confirm_merge(job.id, True)
+    await runner.confirm_merge(job.id, True, operator_id=7)
 
     assert store.merge_calls == [{"repository": "acme/repo", "number": 12, "sha": "abc123"}]
     fresh = await jobs.get(job.id)
@@ -186,7 +186,7 @@ async def test_pr010_github_merge_failure_does_not_mark_done(harness):
     ]
     store.fail_merge = "required status check is pending"
 
-    await runner.confirm_merge(job.id, True)
+    await runner.confirm_merge(job.id, True, operator_id=7)
 
     fresh = await jobs.get(job.id)
     assert fresh.state != JobState.DONE
@@ -248,8 +248,8 @@ async def test_pr013_oversized_diff_is_not_truncated(harness, settings):
     assert notifier.documents == []
     assert store.prs[12].merged is False
     text = next(t for _, t in notifier.texts if "превышает лимит" in t)
+    assert "Полный diff: https://github.com/acme/repo/pull/12.diff" in text
     assert "PR: https://github.com/acme/repo/pull/12" in text
-    assert "\n\nPR:" in text
 
 
 async def test_pr014_github_down_on_diff(harness):
@@ -308,7 +308,7 @@ async def test_pr017_ci_flips_after_confirmation_screen(harness):
     store.runs["copilot/fix-12"] = [
         {"id": 2, "status": "completed", "conclusion": "failure"}
     ]
-    await runner.confirm_merge(job.id, True)
+    await runner.confirm_merge(job.id, True, operator_id=7)
 
     assert store.merge_calls == []
     fresh = await jobs.get(job.id)
@@ -336,3 +336,147 @@ async def test_pr019_github_down_on_merge_check(harness):
 
     assert store.merge_calls == []
     assert any("Не удалось проверить состояние" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr022_confirm_after_head_moved(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr(head_sha="abc123")
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    await runner.request_merge(job.id)
+    store.prs[12].head_sha = "fff999"
+    await runner.confirm_merge(job.id, True, operator_id=7)
+
+    assert store.merge_calls == []
+    fresh = await jobs.get(job.id)
+    assert fresh.state == JobState.WAIT_TESTS
+    assert fresh.merge_head_sha is None
+    assert any("изменился" in text and "/merge" in text for _, text in notifier.texts)
+
+
+async def test_pr025_unauthorized_confirm_does_not_merge(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+    await runner.request_merge(job.id)
+
+    from domain.errors import UserFacingError
+
+    try:
+        await runner.confirm_merge(job.id, True, operator_id=99)
+        raised = None
+    except UserFacingError as exc:
+        raised = exc
+
+    assert raised is not None
+    assert str(raised) == "Нет доступа."
+    assert store.merge_calls == []
+    fresh = await jobs.get(job.id)
+    assert fresh.state == JobState.MERGE_CONFIRMATION_PENDING
+    assert fresh.state != JobState.DONE
+
+
+async def test_pr026_unauthorized_cancel_does_not_revert(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+    await runner.request_merge(job.id)
+
+    from domain.errors import UserFacingError
+    import pytest
+
+    with pytest.raises(UserFacingError, match="Нет доступа"):
+        await runner.confirm_merge(job.id, False, operator_id=99)
+
+    fresh = await jobs.get(job.id)
+    assert fresh.state == JobState.MERGE_CONFIRMATION_PENDING
+    assert store.merge_calls == []
+
+
+async def test_pr027_empty_allowlist_blocks_confirm(harness, settings):
+    settings.telegram_allowed_user_ids = ""
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(
+        jobs,
+        state=JobState.MERGE_CONFIRMATION_PENDING,
+        merge_head_sha="abc123",
+        state_before_merge=JobState.WAIT_TESTS,
+    )
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    from domain.errors import UserFacingError
+    import pytest
+
+    with pytest.raises(UserFacingError, match="Нет доступа"):
+        await runner.confirm_merge(job.id, True, operator_id=7)
+
+    assert store.merge_calls == []
+    fresh = await jobs.get(job.id)
+    assert fresh.state != JobState.DONE
+
+
+async def test_unexpected_diff_error_is_not_masked_as_github_down(harness):
+    jobs, store, runner, github, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["github"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+
+    async def _boom(_number: int):
+        raise AttributeError("broken mapper")
+
+    github.get_pull_request = _boom  # type: ignore[method-assign]
+    await runner.request_diff(job.id)
+    assert any("Внутренняя ошибка" in text for _, text in notifier.texts)
+    assert not any("Не удалось получить diff" in text for _, text in notifier.texts)
+
+
+async def test_pr028_allowlisted_teammate_can_confirm(harness, settings):
+    settings.telegram_allowed_user_ids = "7,8"
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs, user_id=7)
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+    await runner.request_merge(job.id)
+
+    await runner.confirm_merge(job.id, True, operator_id=8)
+
+    assert store.merge_calls == [
+        {"repository": "acme/repo", "number": 12, "sha": "abc123"}
+    ]
+    fresh = await jobs.get(job.id)
+    assert fresh.state == JobState.DONE
+    assert any("успешно объединён" in text for _, text in notifier.texts)
