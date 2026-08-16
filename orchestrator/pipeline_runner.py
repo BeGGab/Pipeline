@@ -369,7 +369,15 @@ class PipelineRunner:
             if job is not None:
                 await self.notifier.send_text(job.chat_id, str(exc))
             return
-        pr = await self.github.get_pull_request(job.pr_number)
+        try:
+            pr = await self.github.get_pull_request(job.pr_number)
+        except Exception:
+            await self.notifier.send_text(
+                job.chat_id,
+                "Не удалось получить diff Pull Request.\n"
+                "Попробуйте повторить команду позже.",
+            )
+            return
         if pr.merged:
             await self._mark_observed_merged(job)
             await self.notifier.send_text(job.chat_id, "Pull Request уже объединён.")
@@ -398,7 +406,7 @@ class PipelineRunner:
         if len(data) > self.settings.telegram_max_document_bytes:
             await self.notifier.send_text(
                 job.chat_id,
-                "Diff сформирован, но его размер превышает лимит Telegram.\n"
+                "Diff сформирован, но его размер превышает лимит Telegram.\n\n"
                 f"PR: {pr.html_url}",
             )
             return
@@ -424,7 +432,15 @@ class PipelineRunner:
             if job is not None:
                 await self.notifier.send_text(job.chat_id, str(exc))
             return
-        decision = await self._evaluate_merge(job)
+        try:
+            decision = await self._evaluate_merge(job)
+        except Exception:
+            await self.notifier.send_text(
+                job.chat_id,
+                "Не удалось проверить состояние Pull Request.\n"
+                "Попробуйте повторить команду позже.",
+            )
+            return
         if decision.already_merged:
             await self._mark_observed_merged(job)
             await self.notifier.send_text(
@@ -461,7 +477,15 @@ class PipelineRunner:
                 await self._revert_merge_pending(job)
             await self.notifier.send_text(job.chat_id, "Merge отменён.")
             return
-        decision = await self._evaluate_merge(job)
+        try:
+            decision = await self._evaluate_merge(job)
+        except Exception:
+            await self.notifier.send_text(
+                job.chat_id,
+                "Не удалось проверить состояние Pull Request.\n"
+                "Попробуйте повторить команду позже.",
+            )
+            return
         if decision.already_merged:
             await self._mark_observed_merged(job)
             await self.notifier.send_text(

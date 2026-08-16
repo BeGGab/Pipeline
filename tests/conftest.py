@@ -50,6 +50,7 @@ class FakePRStore:
     merge_calls: list[dict] = field(default_factory=list)
     diff_calls: list[int] = field(default_factory=list)
     fail_diff = False
+    fail_get_pr = False
     fail_merge: str | None = None
 
 
@@ -72,6 +73,8 @@ class FakeGitHub:
         return issue
 
     async def get_pull_request(self, pull_request_number: int) -> GitHubPullRequest:
+        if self.store.fail_get_pr:
+            raise RuntimeError("github unavailable")
         return self.store.prs[pull_request_number]
 
     async def get_pull_request_diff(

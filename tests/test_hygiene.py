@@ -34,3 +34,13 @@ def test_no_live_github_copilot_bot_default():
         if "github-copilot[bot]" in text and not allowed_context:
             forbidden.append(str(path.relative_to(ROOT)))
     assert forbidden == []
+
+
+def test_telegram_adapter_does_not_import_github():
+    telegram_root = ROOT / "adapters" / "telegram"
+    leaks = []
+    for path in telegram_root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "adapters.github" in text or "from ports.github" in text:
+            leaks.append(str(path.relative_to(ROOT)))
+    assert leaks == []

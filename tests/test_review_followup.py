@@ -177,3 +177,76 @@ async def test_merge_callback_answers_when_job_id_lookup_fails():
     assert callback.answers
     assert callback.answers[0]["alert"] is True
     assert "Нет активной задачи" in callback.answers[0]["text"]
+
+
+class _Message:
+    def __init__(self, text: str, *, user_id: int = 7, chat_id: int = 100) -> None:
+        self.text = text
+        self.chat = SimpleNamespace(id=chat_id)
+        self.from_user = SimpleNamespace(id=user_id)
+        self.reply_to_message = None
+        self.answers: list[str] = []
+
+    async def answer(self, text: str) -> None:
+        self.answers.append(text)
+
+
+async def test_merge_ignores_user_supplied_pr_number():
+    from adapters.jobs.memory import InMemoryJobRepository
+
+    jobs = InMemoryJobRepository()
+    job = await seed_job(jobs)
+    settings = Settings(telegram_allowed_user_ids="7")
+    calls: list[str] = []
+
+    class _Orch:
+        async def request_merge(self, job_id: str) -> None:
+            calls.append(job_id)
+
+    handlers = TelegramHandlers(_Orch(), jobs, settings)
+    await handlers.on_merge(_Message("/merge 123"))
+
+    assert calls == [job.id]
+
+
+async def test_diff_ignores_user_supplied_pr_number():
+    from adapters.jobs.memory import InMemoryJobRepository
+
+    jobs = InMemoryJobRepository()
+    job = await seed_job(jobs)
+    settings = Settings(telegram_allowed_user_ids="7")
+    calls: list[str] = []
+
+    class _Orch:
+        async def request_diff(self, job_id: str) -> None:
+            calls.append(job_id)
+
+    handlers = TelegramHandlers(_Orch(), jobs, settings)
+    await handlers.on_diff(_Message("/diff 99"))
+
+    assert calls == [job.id]
+
+
+async def test_diff_and_merge_fail_closed_without_allowlist():
+    from adapters.jobs.memory import InMemoryJobRepository
+
+    jobs = InMemoryJobRepository()
+    settings = Settings(telegram_allowed_user_ids="")
+    called = {"diff": 0, "merge": 0}
+
+    class _Orch:
+        async def request_diff(self, job_id: str) -> None:
+            called["diff"] += 1
+
+        async def request_merge(self, job_id: str) -> None:
+            called["merge"] += 1
+
+    handlers = TelegramHandlers(_Orch(), jobs, settings)
+    diff_msg = _Message("/diff")
+    merge_msg = _Message("/merge")
+    await handlers.on_diff(diff_msg)
+    await handlers.on_merge(merge_msg)
+
+    assert called == {"diff": 0, "merge": 0}
+    assert diff_msg.answers == ["Нет доступа."]
+    assert merge_msg.answers == ["Нет доступа."]

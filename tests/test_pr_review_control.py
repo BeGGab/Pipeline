@@ -192,3 +192,147 @@ async def test_pr010_github_merge_failure_does_not_mark_done(harness):
     assert fresh.state != JobState.DONE
     assert any("Не удалось выполнить merge" in text for _, text in harness["notifier"].texts)
     assert any("required status check" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr011_closed_pr_blocks_diff(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr(merged=False, state="closed")
+    store.diffs[12] = "should-not-send\n"
+
+    await runner.request_diff(job.id)
+
+    assert store.diff_calls == []
+    assert store.merge_calls == []
+    assert notifier.documents == []
+    assert any("закрыт" in text and "недоступен" in text for _, text in notifier.texts)
+
+
+async def test_pr012_empty_diff_is_not_sent_as_file(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+    store.diffs[12] = "   \n"
+
+    await runner.request_diff(job.id)
+
+    assert store.diff_calls == [12]
+    assert notifier.documents == []
+    assert any("нет изменений" in text for _, text in notifier.texts)
+
+
+async def test_pr013_oversized_diff_is_not_truncated(harness, settings):
+    settings.telegram_max_document_bytes = 8
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+    store.diffs[12] = "diff --git a/x b/x\n+too-big\n"
+
+    await runner.request_diff(job.id)
+
+    assert notifier.documents == []
+    assert store.prs[12].merged is False
+    text = next(t for _, t in notifier.texts if "превышает лимит" in t)
+    assert "PR: https://github.com/acme/repo/pull/12" in text
+    assert "\n\nPR:" in text
+
+
+async def test_pr014_github_down_on_diff(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.fail_get_pr = True
+
+    await runner.request_diff(job.id)
+
+    assert store.diff_calls == []
+    assert store.merge_calls == []
+    assert any("Не удалось получить diff" in text for _, text in notifier.texts)
+
+
+async def test_pr015_copilot_waiting_blocks_merge(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs, awaiting_user_reply=True)
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    await runner.request_merge(job.id)
+
+    assert store.merge_calls == []
+    assert any("ожидает ответа" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr016_closed_unmerged_pr_blocks_merge(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr(merged=False, state="closed")
+
+    await runner.request_merge(job.id)
+
+    assert store.merge_calls == []
+    assert any("закрыт и не может быть объединён" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr017_ci_flips_after_confirmation_screen(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr()
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    await runner.request_merge(job.id)
+    assert store.merge_calls == []
+
+    store.runs["copilot/fix-12"] = [
+        {"id": 2, "status": "completed", "conclusion": "failure"}
+    ]
+    await runner.confirm_merge(job.id, True)
+
+    assert store.merge_calls == []
+    fresh = await jobs.get(job.id)
+    assert fresh.state != JobState.DONE
+    assert any("CI завершился с ошибкой" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr018_second_merge_after_done_is_idempotent(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs, state=JobState.DONE)
+    store.prs[12] = open_pr(merged=True, state="closed")
+
+    await runner.request_merge(job.id)
+
+    assert store.merge_calls == []
+    assert any("уже объединён" in text for _, text in harness["notifier"].texts)
+
+
+async def test_pr019_github_down_on_merge_check(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(jobs)
+    store.fail_get_pr = True
+
+    await runner.request_merge(job.id)
+
+    assert store.merge_calls == []
+    assert any("Не удалось проверить состояние" in text for _, text in harness["notifier"].texts)

@@ -3,9 +3,17 @@
 Telegram control channel for GitHub Copilot coding agent.
 
 ```
-/new → Issue → Copilot → PR → Telegram (ссылка)
-     → /diff → PR-N.diff → внешнее ревью → при необходимости Copilot fixes
-     → /diff → /merge → confirmation → GitHub merge → задача завершена
+/new
+  → GitHub Issue
+  → Copilot
+  → PR
+  → Telegram: PR создан
+  → /diff → PR-N.diff → внешнее ревью
+  → при необходимости Copilot fixes → новый commit
+  → /diff → повторное ревью
+  → /merge → подтверждение
+  → GitHub merge
+  → Telegram: задача завершена
 ```
 
 AI-review в MVP нет: комментарий «Pipeline check: CI passed, no automated review configured.»
@@ -62,8 +70,8 @@ python -m app.main
 | Command | Effect |
 | --- | --- |
 | `/new <text>` | Create issue, assign Copilot |
-| `/diff` | Live unified diff of the current job PR |
-| `/merge` | Status + Merge/Cancel buttons |
+| `/diff` | Live unified diff of the current job PR as `PR-{n}.diff` |
+| `/merge` | Status + Merge/Cancel for the current job PR only (`/merge 123` is ignored) |
 | `/status` | Current job state |
 
 ## Tests
@@ -72,7 +80,7 @@ python -m app.main
 pytest
 ```
 
-Covers BUG-001…009, PR-001…PR-013, and process-restart persistence (`TEST-015+`).
+Covers BUG-001…009 and PIPE-PR-001 (`TEST-015+`, PR-001…PR-024).
 
 ## Layout
 
