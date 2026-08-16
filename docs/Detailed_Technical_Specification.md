@@ -75,13 +75,14 @@ PR: <link>
 [ Merge ]  [ Cancel ]
 ```
 
-Checks run on `/merge` and again on confirm:
+Checks run on `/merge` and again on confirm (TOCTOU):
 
 - PR belongs to the current job
 - PR is open and not merged
 - required GitHub Actions completed successfully
 - Copilot is not waiting for a user reply
 - GitHub allows merge (`mergeable` / `mergeable_state`)
+- confirm merges the SHA frozen at `/merge`, not current HEAD; if the SHA changed, merge is denied and the operator must `/merge` again
 
 Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
 
@@ -95,10 +96,11 @@ Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
 - Telegram adapter does not call GitHub API.
 - Chain: Telegram → Adapter → Orchestrator → GitHubPort → GitHub Adapter → API.
 - No separate Telegram FSM.
+- Jobs and processed event IDs are stored in `JOBS_STORE_PATH` so a process restart can recover in-flight work. Empty path keeps an in-memory store (tests).
 
 ## Out of scope
 
-Auto-merge, merge by PR number, automated AI review, persistent storage, branch deletion, a merge workflow.
+Auto-merge, merge by PR number, automated AI review, branch deletion, a merge workflow.
 
 ## ISSUE-001
 

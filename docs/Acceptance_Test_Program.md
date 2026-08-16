@@ -48,5 +48,8 @@ Bot text does not claim an AI review that was not performed.
 | PR-008 | No PR → clear text, no GitHub mutation |
 | PR-009 | Telegram `send_document` error → PR/job unchanged |
 | PR-010 | GitHub merge error → job not `DONE` |
+| PR-011 | Confirm after HEAD moved → no merge, must `/merge` again |
+| PR-012 | Process restart reloads jobs from `JOBS_STORE_PATH` and notifies the operator |
+| PR-013 | Merge callback without job_id still answers Telegram (button does not hang) |
 
-Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`.
+Automated coverage: `tests/test_pr_review_control.py`, `tests/test_bug_regressions.py`, `tests/test_review_followup.py`.

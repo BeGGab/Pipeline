@@ -1,0 +1,179 @@
+"""Review follow-up: disk jobs, frozen merge SHA, callback always answers."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from adapters.jobs.file_store import FileJobRepository
+from adapters.telegram.handlers import TelegramHandlers
+from config.settings import Settings
+from domain.models import EventType, Job, JobState, PipelineEvent
+from orchestrator.pipeline_runner import PipelineRunner
+from tests.conftest import FakeCodingAgent, FakeGitHub, FakeNotifier, FakePRStore, open_pr, seed_job
+
+
+async def test_file_store_survives_reload(tmp_path):
+    path = tmp_path / "jobs.json"
+    repo = FileJobRepository(path)
+    job = Job(
+        chat_id=100,
+        user_id=7,
+        repository="acme/repo",
+        title="task",
+        body="do the thing",
+        state=JobState.WAIT_TESTS,
+        issue_number=3,
+        issue_url="https://github.com/acme/repo/issues/3",
+        pr_number=12,
+        merge_head_sha="abc123",
+    )
+    await repo.save(job)
+    await repo.replace_processed_event_ids({"comment-started-99"})
+
+    reloaded = FileJobRepository(path)
+    loaded = await reloaded.get(job.id)
+    assert loaded is not None
+    assert loaded.state == JobState.WAIT_TESTS
+    assert loaded.pr_number == 12
+    assert loaded.merge_head_sha == "abc123"
+    assert "comment-started-99" in reloaded.processed_event_ids
+    live = await reloaded.list_non_terminal()
+    assert [item.id for item in live] == [job.id]
+
+
+async def test_file_store_skips_corrupt_file(tmp_path):
+    path = tmp_path / "jobs.json"
+    path.write_text("{not-json", encoding="utf-8")
+    repo = FileJobRepository(path)
+    assert await repo.list_non_terminal() == []
+    job = Job(
+        chat_id=1,
+        user_id=1,
+        repository="acme/repo",
+        title="t",
+        body="b",
+    )
+    await repo.save(job)
+    assert (await FileJobRepository(path).get(job.id)) is not None
+
+
+async def test_recover_after_restart_reloads_jobs_and_notifies(tmp_path, settings):
+    path = tmp_path / "jobs.json"
+    first = FileJobRepository(path)
+    job = await seed_job(first, state=JobState.CODING_AGENT_RUNNING)
+    store = FakePRStore()
+    notifier = FakeNotifier()
+    runner = PipelineRunner(
+        settings=settings,
+        jobs=first,
+        github=FakeGitHub(store),
+        coding_agent=FakeCodingAgent(),
+        notifier=notifier,
+    )
+    await runner.process_event(
+        PipelineEvent(
+            event_id="comment-started-1",
+            type=EventType.AGENT_STARTED,
+            issue_number=3,
+        )
+    )
+
+    second_jobs = FileJobRepository(path)
+    second_notifier = FakeNotifier()
+    restarted = PipelineRunner(
+        settings=settings,
+        jobs=second_jobs,
+        github=FakeGitHub(FakePRStore()),
+        coding_agent=FakeCodingAgent(),
+        notifier=second_notifier,
+    )
+    await restarted.recover_active_jobs()
+
+    live = await second_jobs.list_non_terminal()
+    assert len(live) == 1
+    assert live[0].id == job.id
+    assert live[0].state == JobState.CODING_AGENT_RUNNING
+    assert "comment-started-1" in restarted.processed_event_ids
+    assert any("перезапущен" in text for _, text in second_notifier.texts)
+    assert job.id in restarted._watch_tasks
+
+
+async def test_confirm_merge_uses_frozen_sha_and_rejects_head_move(harness):
+    jobs, store, runner, notifier = (
+        harness["jobs"],
+        harness["store"],
+        harness["runner"],
+        harness["notifier"],
+    )
+    job = await seed_job(jobs)
+    store.prs[12] = open_pr(head_sha="abc123")
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    await runner.request_merge(job.id)
+    store.prs[12].head_sha = "fff999"
+    await runner.confirm_merge(job.id, True)
+
+    assert store.merge_calls == []
+    fresh = await jobs.get(job.id)
+    assert fresh.state == JobState.WAIT_TESTS
+    assert fresh.merge_head_sha is None
+    assert any("изменился" in text and "/merge" in text for _, text in notifier.texts)
+
+
+async def test_confirm_merge_sends_frozen_sha_not_later_head(harness):
+    jobs, store, runner = harness["jobs"], harness["store"], harness["runner"]
+    job = await seed_job(
+        jobs,
+        state=JobState.MERGE_CONFIRMATION_PENDING,
+        merge_head_sha="pinned-sha",
+        state_before_merge=JobState.TEST_PASSED,
+    )
+    store.prs[12] = open_pr(head_sha="pinned-sha")
+    store.runs["copilot/fix-12"] = [
+        {"id": 1, "status": "completed", "conclusion": "success"}
+    ]
+
+    await runner.confirm_merge(job.id, True)
+
+    assert store.merge_calls == [
+        {"repository": "acme/repo", "number": 12, "sha": "pinned-sha"}
+    ]
+
+
+class _Callback:
+    def __init__(self, *, data: str, chat_id: int = 100, user_id: int = 7) -> None:
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id)
+        self.message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), answers=[])
+        self.answers: list[dict] = []
+
+        async def _message_answer(text: str) -> None:
+            self.message.answers.append(text)
+
+        self.message.answer = _message_answer
+
+    async def answer(self, text: str = "", show_alert: bool = False) -> None:
+        self.answers.append({"text": text, "alert": show_alert})
+
+
+async def test_merge_callback_answers_when_job_id_lookup_fails():
+    from adapters.jobs.memory import InMemoryJobRepository
+
+    jobs = InMemoryJobRepository()
+    settings = Settings(telegram_allowed_user_ids="7")
+    calls: list[tuple] = []
+
+    class _Orch:
+        async def confirm_merge(self, job_id: str, confirmed: bool) -> None:
+            calls.append((job_id, confirmed))
+
+    handlers = TelegramHandlers(_Orch(), jobs, settings)
+    callback = _Callback(data="merge:confirm")
+    await handlers.on_merge_callback(callback)
+
+    assert calls == []
+    assert callback.answers
+    assert callback.answers[0]["alert"] is True
+    assert "Нет активной задачи" in callback.answers[0]["text"]
