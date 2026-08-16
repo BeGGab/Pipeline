@@ -40,7 +40,7 @@ async def test_confirm_merge_requires_pending(harness):
     store.runs["copilot/fix-12"] = [
         {"id": 1, "status": "completed", "conclusion": "success"}
     ]
-    await runner.confirm_merge(job.id, True)
+    await runner.confirm_merge(job.id, True, operator_id=7)
     assert store.merge_calls == []
     assert any("/merge" in text for _, text in harness["notifier"].texts)
 

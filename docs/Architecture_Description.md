@@ -46,6 +46,16 @@ One login: `copilot-swe-agent[bot]`. The older assumption of a separate `github-
 
 Single parse path: `webhooks/router.py` → `coding_agent.parse_webhook_event` → `process_event`. Dead `handle_*` helpers are not present.
 
+## Review / merge control (PIPE-PR-001)
+
+Telegram is a thin control channel, not a GitHub client.
+
+- `/diff` → Orchestrator.`request_diff` → GitHubPort.`get_pull_request_diff` (live unified diff) → NotifierPort.`send_document` (`PR-{n}.diff`)
+- `/merge` → Orchestrator.`request_merge` (status + buttons) → `confirm_merge(job_id, confirmed, operator_id=)` → GitHubPort.`merge_pull_request`
+- Merge confirmation is allowlist-only (`operator_id ∈ TELEGRAM_ALLOWED_USER_IDS`), not bound to `job.user_id`. The check runs at confirm entry and again before GitHub as defense-in-depth, not as an atomic lock.
+- Job FSM is the only process model (`MERGE_CONFIRMATION_PENDING` is a job state, not a Telegram FSM)
+- `/merge 123` and `/diff 123` are rejected with an explicit message; only the PR bound to the current job is used
+
 ## Review comment
 
 MVP does not run an LLM review. After CI pass the bot posts:

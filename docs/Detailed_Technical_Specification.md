@@ -47,22 +47,25 @@ Primary signal: non-empty `requested_reviewers`, or the PR left draft after we a
 
 ### FR-6 `/diff`
 
-`/diff` returns the current unified diff of the job's PR as a Telegram document `PR-{n}.diff`.
+`/diff` returns the current unified diff of the job's PR as a Telegram document `PR-{n}.diff` with caption `PR #{n} — актуальный diff для ревью`. Extra arguments (`/diff 123`) are rejected with an explicit message; the command does not run against another PR.
 
 | Condition | Message |
 | --- | --- |
 | no PR | Для текущей задачи Pull Request ещё не создан. |
 | PR closed | Pull Request закрыт. Актуальный diff недоступен. |
 | PR merged | Pull Request уже объединён. |
-| GitHub error | Не удалось получить diff Pull Request. |
+| GitHub error | Не удалось получить diff Pull Request. Попробуйте повторить команду позже. |
 | empty diff | В Pull Request нет изменений для передачи на ревью. |
-| over Telegram limit | Diff сформирован, но его размер превышает лимит Telegram. |
+| over Telegram limit | Diff сформирован, но его размер превышает лимит Telegram. + `Полный diff: <pr>.diff` + PR link. The command is complete: the full unified diff stays available on GitHub for an external reviewer. |
+| Telegram send error | Не удалось отправить diff в Telegram. + PR link |
 
-The diff is always fetched live (`Accept: application/vnd.github.diff`). No cache. A Telegram send failure does not change PR/job state.
+The diff is always fetched live (`Accept: application/vnd.github.diff`). No cache, no local agent diff, no PR body, no file list. A Telegram send failure does not change PR/job state. The earlier “PR created” notification is not replaced.
 
 ### FR-7 `/merge`
 
-`/merge` never merges immediately. It shows status and asks for confirmation.
+`/merge` never merges immediately. It shows status and asks for confirmation. `/merge 123` is rejected: the bot explains that a PR number is not accepted and does not merge anything. Only a bare `/merge` for the current job proceeds.
+
+Merge rights are the Telegram allowlist, not task ownership (`job.user_id`). Any id in `TELEGRAM_ALLOWED_USER_IDS` may confirm or cancel. `confirm_merge` checks the allowlist at entry and again before `merge_pull_request` as defense-in-depth; that is not an atomic authorization guarantee. An allowlist miss raises `Нет доступа.` and does not mutate the job or call GitHub. `/status` uses the same allowlist.
 
 ```
 PR #{n}
@@ -81,10 +84,21 @@ Checks run on `/merge` and again on confirm (TOCTOU):
 - PR is open and not merged
 - required GitHub Actions completed successfully
 - Copilot is not waiting for a user reply
+- operator is on the Telegram allowlist
 - GitHub allows merge (`mergeable` / `mergeable_state`)
 - confirm merges the SHA frozen at `/merge`, not current HEAD; if the SHA changed, merge is denied and the operator must `/merge` again
 
-Success moves the job to `DONE`. GitHub merge errors leave the job non-DONE.
+| Condition | Message |
+| --- | --- |
+| CI running | Merge пока невозможен: проверки CI ещё выполняются. |
+| CI failure | Merge невозможен: CI завершился с ошибкой. |
+| already merged | PR #{n} уже объединён. |
+| closed without merge | PR закрыт и не может быть объединён. |
+| Copilot waiting | Merge пока невозможен: Copilot ожидает ответа пользователя. |
+| HEAD moved | PR изменился с момента /merge. Повторите /merge. |
+| GitHub merge error | Не удалось выполнить merge PR #{n}. Причина: \<GitHub\> |
+
+Success: `PR #{n} успешно объединён.` + `Задача завершена.` + PR URL, job → `DONE`. GitHub merge errors leave the job non-DONE. Telegram never calls GitHub; merge goes Orchestrator → GitHubPort → GitHub Adapter → API.
 
 ### FR-8 Authorization
 
