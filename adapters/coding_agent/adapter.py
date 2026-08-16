@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+from collections.abc import AsyncIterator
+
+from adapters.github.issues import _COPILOT_ASSIGNEE_ALIASES
+from config.settings import Settings
+from domain.models import EventType, PipelineEvent
+
+_FIX_TRIGGER_TEXT = "@copilot Fix the failing tests"
+
+_COMPLETION_RE = re.compile(
+    r"(task (is )?complete|ready for review|i('ve| have) completed)",
+    re.IGNORECASE,
+)
+_QUESTION_RE = re.compile(
+    r"(\?|please (confirm|clarify|choose)|waiting for (your )?(reply|answer))",
+    re.IGNORECASE,
+)
+
+
+class CodingAgentAdapter:
+    def __init__(self, github, settings: Settings) -> None:
+        self.github = github
+        self.settings = settings
+        self._seen_comment_ids: set[str] = set()
+        self._seen_pr_ids: set[int] = set()
+        self._seen_run_ids: set[int] = set()
+
+    def _is_coding_agent_login(self, login: str) -> bool:
+        allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
+        return (login or "").strip().lower() in allowed
+
+    async def trigger(self, issue_number: int) -> None:
+        await self.github.issues.assign_copilot(issue_number)
+
+    async def trigger_fix_iteration(self, issue_number: int, error_log: str) -> None:
+        body = f"{_FIX_TRIGGER_TEXT}\n\n```\n{error_log.strip()}\n```"
+        await self.github.comments.create_issue_comment(issue_number, body)
+
+    async def detect_task_completion(
+        self, issue_number: int, pr_number: int | None
+    ) -> bool:
+        if pr_number:
+            pr = await self.github.pull_requests.get_pull_request(pr_number)
+            if pr.draft is False or pr.requested_reviewers:
+                return True
+        if await self._issue_is_closed(issue_number):
+            return True
+        comments = await self.github.comments.list_issue_comments(issue_number)
+        return any(
+            self._looks_like_completion_text(self._comment_body(c))
+            for c in comments
+            if self._is_coding_agent_login(self._comment_login(c))
+        )
+
+    async def _issue_is_closed(self, issue_number: int) -> bool:
+        issue = await self.github.issues.get_issue(issue_number)
+        return (issue.get("state") or "").lower() == "closed"
+
+    def _looks_like_completion_text(self, body: str) -> bool:
+        return bool(_COMPLETION_RE.search(body or ""))
+
+    def _looks_like_question(self, body: str) -> bool:
+        return bool(_QUESTION_RE.search(body or ""))
+
+    def _comment_login(self, comment) -> str:
+        if hasattr(comment, "user"):
+            return getattr(comment.user, "login", "") or ""
+        user = comment.get("user") if isinstance(comment, dict) else None
+        if isinstance(user, dict):
+            return user.get("login") or ""
+        return ""
+
+    def _comment_body(self, comment) -> str:
+        if hasattr(comment, "body"):
+            return comment.body or ""
+        return (comment.get("body") if isinstance(comment, dict) else "") or ""
+
+    def _comment_id(self, comment) -> str:
+        if hasattr(comment, "id"):
+            return str(comment.id)
+        return str((comment.get("id") if isinstance(comment, dict) else "") or "")
+
+    async def watch_issue(self, issue_number: int) -> AsyncIterator[PipelineEvent]:
+        interval = self.settings.coding_agent_poll_interval_sec
+        timeout = self.settings.coding_agent_poll_timeout_sec
+        elapsed = 0
+        while elapsed < timeout:
+            async for event in self._poll_once(issue_number):
+                yield event
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+    async def _poll_once(self, issue_number: int) -> AsyncIterator[PipelineEvent]:
+        comments = await self.github.comments.list_issue_comments(issue_number)
+        for comment in comments:
+            cid = self._comment_id(comment)
+            if not cid or cid in self._seen_comment_ids:
+                continue
+            self._seen_comment_ids.add(cid)
+            event = self._event_from_comment(issue_number, comment)
+            if event:
+                yield event
+
+        pulls = await self.github.pull_requests.list_pulls_for_issue(issue_number)
+        for raw in pulls:
+            number = raw.get("number")
+            if not number or number in self._seen_pr_ids:
+                continue
+            self._seen_pr_ids.add(number)
+            pr = await self.github.pull_requests.get_pull_request(number)
+            yield PipelineEvent(
+                event_id=f"pr-opened-{number}",
+                type=EventType.PR_OPENED,
+                issue_number=issue_number,
+                pr_number=number,
+                payload={"html_url": pr.html_url, "head_ref": pr.head_ref},
+            )
+            if await self.detect_task_completion(issue_number, number):
+                yield PipelineEvent(
+                    event_id=f"agent-completed-{number}",
+                    type=EventType.AGENT_COMPLETED,
+                    issue_number=issue_number,
+                    pr_number=number,
+                )
+            if pr.head_ref:
+                async for event in self._poll_actions(issue_number, number, pr.head_ref):
+                    yield event
+
+        if await self._issue_is_closed(issue_number):
+            yield PipelineEvent(
+                event_id=f"issue-closed-{issue_number}",
+                type=EventType.ISSUE_CLOSED,
+                issue_number=issue_number,
+            )
+
+    async def _poll_actions(
+        self, issue_number: int, pr_number: int, branch: str
+    ) -> AsyncIterator[PipelineEvent]:
+        runs = await self.github.actions.list_runs_for_branch(branch)
+        for run in runs:
+            run_id = run.get("id")
+            status = (run.get("status") or "").lower()
+            conclusion = (run.get("conclusion") or "").lower()
+            if not run_id or status != "completed" or run_id in self._seen_run_ids:
+                continue
+            self._seen_run_ids.add(run_id)
+            if conclusion == "success":
+                yield PipelineEvent(
+                    event_id=f"run-success-{run_id}",
+                    type=EventType.TESTS_PASSED,
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                )
+            elif conclusion in {"failure", "timed_out", "cancelled"}:
+                logs = await self.github.actions.get_run_logs(run_id)
+                yield PipelineEvent(
+                    event_id=f"run-failure-{run_id}",
+                    type=EventType.TESTS_FAILED,
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    error_log=logs,
+                )
+
+    def _event_from_comment(
+        self, issue_number: int, comment
+    ) -> PipelineEvent | None:
+        login = self._comment_login(comment)
+        if not self._is_coding_agent_login(login):
+            return None
+        body = self._comment_body(comment)
+        cid = self._comment_id(comment)
+        if self._looks_like_completion_text(body):
+            return PipelineEvent(
+                event_id=f"comment-complete-{cid}",
+                type=EventType.AGENT_COMPLETED,
+                issue_number=issue_number,
+                body=body,
+            )
+        if self._looks_like_question(body):
+            return PipelineEvent(
+                event_id=f"comment-question-{cid}",
+                type=EventType.COPILOT_QUESTION,
+                issue_number=issue_number,
+                body=body,
+            )
+        return PipelineEvent(
+            event_id=f"comment-started-{cid}",
+            type=EventType.AGENT_STARTED,
+            issue_number=issue_number,
+            body=body,
+        )
+
+    def parse_webhook_event(
+        self, event_name: str, payload: dict
+    ) -> PipelineEvent | None:
+        name = (event_name or "").lower()
+        if name in {"issues", "issue_comment"}:
+            return self._parse_issue_webhook(name, payload)
+        if name == "pull_request":
+            return self._parse_pr_webhook(payload)
+        if name == "workflow_run":
+            return self._parse_actions_webhook(payload)
+        return None
+
+    def _stable_id(self, *parts: object) -> str:
+        raw = json.dumps(parts, default=str, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _parse_issue_webhook(
+        self, name: str, payload: dict
+    ) -> PipelineEvent | None:
+        issue = payload.get("issue") or {}
+        issue_number = issue.get("number")
+        if not issue_number:
+            return None
+        if name == "issues" and payload.get("action") == "closed":
+            return PipelineEvent(
+                event_id=self._stable_id("issue-closed", issue_number, payload.get("action")),
+                type=EventType.ISSUE_CLOSED,
+                issue_number=issue_number,
+            )
+        comment = payload.get("comment") or {}
+        login = ((comment.get("user") or {}).get("login")) or ""
+        if not self._is_coding_agent_login(login):
+            return None
+        body = comment.get("body") or ""
+        cid = comment.get("id") or self._stable_id(issue_number, body)
+        if self._looks_like_completion_text(body):
+            return PipelineEvent(
+                event_id=f"wh-comment-complete-{cid}",
+                type=EventType.AGENT_COMPLETED,
+                issue_number=issue_number,
+                body=body,
+            )
+        if self._looks_like_question(body):
+            return PipelineEvent(
+                event_id=f"wh-comment-question-{cid}",
+                type=EventType.COPILOT_QUESTION,
+                issue_number=issue_number,
+                body=body,
+            )
+        return PipelineEvent(
+            event_id=f"wh-comment-started-{cid}",
+            type=EventType.AGENT_STARTED,
+            issue_number=issue_number,
+            body=body,
+        )
+
+    def _parse_pr_webhook(self, payload: dict) -> PipelineEvent | None:
+        pr = payload.get("pull_request") or {}
+        number = pr.get("number")
+        if not number:
+            return None
+        issue_number = ((pr.get("body") or "") and None) or (
+            (payload.get("issue") or {}).get("number")
+        )
+        action = payload.get("action")
+        login = ((pr.get("user") or {}).get("login")) or ""
+        if action in {"opened", "ready_for_review", "review_requested"}:
+            event_type = (
+                EventType.AGENT_COMPLETED
+                if action in {"ready_for_review", "review_requested"}
+                or pr.get("draft") is False
+                else EventType.PR_OPENED
+            )
+            if action == "opened":
+                event_type = EventType.PR_OPENED
+            if not self._is_coding_agent_login(login) and action == "opened":
+                # PR may still belong to the pipeline job via issue link.
+                event_type = EventType.PR_OPENED
+            return PipelineEvent(
+                event_id=self._stable_id("pr", number, action),
+                type=event_type,
+                issue_number=issue_number,
+                pr_number=number,
+                payload={"html_url": pr.get("html_url") or "", "head_ref": (pr.get("head") or {}).get("ref") or ""},
+            )
+        return None
+
+    def _parse_actions_webhook(self, payload: dict) -> PipelineEvent | None:
+        run = payload.get("workflow_run") or {}
+        if (run.get("status") or "").lower() != "completed":
+            return None
+        run_id = run.get("id")
+        conclusion = (run.get("conclusion") or "").lower()
+        prs = run.get("pull_requests") or []
+        pr_number = prs[0]["number"] if prs else None
+        if conclusion == "success":
+            return PipelineEvent(
+                event_id=f"wh-run-success-{run_id}",
+                type=EventType.TESTS_PASSED,
+                pr_number=pr_number,
+            )
+        if conclusion in {"failure", "timed_out", "cancelled"}:
+            return PipelineEvent(
+                event_id=f"wh-run-failure-{run_id}",
+                type=EventType.TESTS_FAILED,
+                pr_number=pr_number,
+                error_log=run.get("html_url") or f"workflow run {run_id} failed",
+            )
+        return None

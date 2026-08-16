@@ -1,0 +1,51 @@
+# Architecture Description
+
+Hexagonal layout. Telegram is a thin control/review channel. GitHub is the source of truth.
+
+```
+Telegram → Adapter → Orchestrator → GitHubPort → GitHub Adapter → API
+                 ↘ CodingAgentPort ↗
+webhook / watch_issue  →  process_event()  →  Job FSM
+```
+
+`watch_issue` is a reserve for the webhook. Both sources share `process_event` and `processed_event_ids`. There is no second Telegram FSM. Job state is the only process model.
+
+## Layers
+
+| Layer | Package | Responsibility |
+| --- | --- | --- |
+| Application | `orchestrator/` | Job FSM, `/diff`, `/merge`, recover, watchers |
+| Ports | `ports/` | `GitHubPort`, `NotifierPort`, `CodingAgentPort`, `JobRepository` |
+| GitHub adapter | `adapters/github/` | Issues, PRs, comments, Actions, GraphQL assign |
+| Coding agent | `adapters/coding_agent/` | assign, `@copilot` fix, webhook parse, poll |
+| Telegram adapter | `adapters/telegram/` | commands and notifications only |
+| Jobs | `adapters/jobs/` | in-memory store (persistence is out of scope) |
+| HTTP | `app/`, `webhooks/` | FastAPI lifespan, GitHub webhook router |
+
+## Job states
+
+```
+TASK_ACCEPTED
+    → CODING_AGENT_RUNNING
+        → WAIT_TESTS
+            → TEST_PASSED
+                → MERGE_CONFIRMATION_PENDING
+                    → DONE
+ADAPTER_ERROR / FAILED   (terminal)
+```
+
+`CODING_AGENT_RUNNING` and `WAIT_TESTS` do not advance inside `_process_state`. They wait for `process_event`.
+
+## Coding agent login
+
+One login: `copilot-swe-agent[bot]`. The older assumption of a separate `github-copilot[bot]` comment account is wrong and is not used.
+
+## Webhooks
+
+Single parse path: `webhooks/router.py` → `coding_agent.parse_webhook_event` → `process_event`. Dead `handle_*` helpers are not present.
+
+## Review comment
+
+MVP does not run an LLM review. After CI pass the bot posts:
+
+`Pipeline check: CI passed, no automated review configured.`

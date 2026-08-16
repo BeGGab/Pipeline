@@ -1,0 +1,12 @@
+class UserFacingError(Exception):
+    """Error whose message is safe to show in Telegram."""
+
+
+class AssignmentError(UserFacingError):
+    """GitHub accepted the request but did not assign the coding agent."""
+
+
+class MergeError(UserFacingError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
