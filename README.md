@@ -65,6 +65,29 @@ Point a GitHub webhook at `https://<host>/webhooks/github` for `issues`, `issue_
 python -m app.main
 ```
 
+## Docker
+
+Secrets stay in `.env` (not baked into the image). Job state survives container restarts via the `pipeline-data` volume.
+
+```bash
+copy .env.example .env
+docker compose up -d --build
+```
+
+Webhook URL: `https://<host>/webhooks/github`. Health: `GET /health`.
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+To run the image without Compose:
+
+```bash
+docker build -t ai-software-pipeline .
+docker run --rm -p 8080:8080 --env-file .env -v pipeline-data:/app/data ai-software-pipeline
+```
+
 ## Commands
 
 | Command | Effect |
