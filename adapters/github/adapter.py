@@ -16,7 +16,11 @@ class GitHubAdapter:
         self._http = GitHubHttp(settings.github_token)
         self._graphql = GitHubGraphQL(settings.github_token)
         self.issues = IssuesClient(
-            self._http, settings.github_owner, settings.github_repo, self._graphql
+            self._http,
+            settings.github_owner,
+            settings.github_repo,
+            self._graphql,
+            copilot_username=settings.copilot_username,
         )
         self.comments = CommentsClient(
             self._http, settings.github_owner, settings.github_repo

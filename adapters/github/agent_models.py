@@ -1,3 +1,4 @@
-# Один официальный логин coding agent.
-# Предположение про отдельный github-copilot[bot] — ошибочное, не используем.
-COPILOT_CODING_AGENT_LOGIN = "copilot-swe-agent[bot]"
+from adapters.github.copilot_login import DEFAULT_COPILOT_LOGIN
+
+# Re-export. A separate github-copilot[bot] comment account is an erroneous assumption.
+COPILOT_CODING_AGENT_LOGIN = DEFAULT_COPILOT_LOGIN
