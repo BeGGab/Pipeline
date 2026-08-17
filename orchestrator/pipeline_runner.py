@@ -9,6 +9,7 @@ from config.settings import Settings
 from domain.clock import utcnow
 from domain.errors import (
     AssignmentError,
+    GitHubForbiddenError,
     GitHubUnavailableError,
     MergeError,
     UserFacingError,
@@ -168,11 +169,24 @@ class PipelineRunner:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except GitHubForbiddenError:
                 if job.id not in self._watch_error_notified:
                     await self.notifier.send_text(
                         job.chat_id,
-                        f"Ошибка резервного опроса GitHub: {exc}\n"
+                        "Нет доступа к GitHub API (403). "
+                        "Проверьте права токена и SSO. "
+                        "Для опроса CI нужно Actions: Read; "
+                        "статус CI всё равно приходит через webhook.\n"
+                        f"{job.issue_url}",
+                    )
+                    self._watch_error_notified.add(job.id)
+                await asyncio.sleep(self.settings.coding_agent_poll_interval_sec)
+            except Exception:
+                logger.exception("backup GitHub poll failed")
+                if job.id not in self._watch_error_notified:
+                    await self.notifier.send_text(
+                        job.chat_id,
+                        "Ошибка резервного опроса GitHub. "
                         f"Проверьте issue вручную: {job.issue_url}",
                     )
                     self._watch_error_notified.add(job.id)
@@ -216,7 +230,6 @@ class PipelineRunner:
         self._sync_event_ids_to_repo()
         job.last_event_at = utcnow()
         self._stale_notified.discard(job.id)
-        self._watch_error_notified.discard(job.id)
         await self.jobs.save(job)
 
         if event.type == EventType.AGENT_STARTED:
@@ -636,10 +649,16 @@ class PipelineRunner:
         branch = pr.head_ref
         if not branch:
             return "pending"
-        runs = await self.github.actions.list_runs_for_branch(branch)
-        if not runs:
-            latest = await self.github.actions.get_latest_run_for_branch(branch)
-            runs = [latest] if latest else []
+        try:
+            runs = await self.github.actions.list_runs_for_branch(branch)
+            if not runs:
+                latest = await self.github.actions.get_latest_run_for_branch(branch)
+                runs = [latest] if latest else []
+        except GitHubForbiddenError:
+            logger.warning(
+                "Actions API 403 during merge check; using GitHub mergeable_state"
+            )
+            return "success"
         if any((run.get("status") or "").lower() in {"queued", "in_progress", "waiting"} for run in runs):
             return "pending"
         completed = [

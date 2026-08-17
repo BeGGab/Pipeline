@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from adapters.github.copilot_login import copilot_login_aliases
+from adapters.github.http import raise_github_status
 
 
 class GitHubGraphQL:
@@ -22,7 +23,7 @@ class GitHubGraphQL:
             "/graphql",
             json={"query": query, "variables": variables or {}},
         )
-        resp.raise_for_status()
+        raise_github_status(resp)
         payload = resp.json()
         if payload.get("errors"):
             raise RuntimeError(payload["errors"])

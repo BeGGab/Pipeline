@@ -34,9 +34,11 @@ Telegram never calls the GitHub API. GitHub remains the source of truth.
 
 - Python 3.11+
 - Telegram bot token
-- GitHub token that can create issues, assign Copilot, read PRs/Actions, and merge
+- GitHub token that can create issues, assign Copilot, read PRs, merge, and (for backup poll) read Actions
 - Copilot coding agent enabled on the **target** repository
 - CI workflows in the target repository (or ask the agent to add them)
+
+Fine-grained PAT: Repository permissions **Actions: Read**, **Contents: Read**, **Issues: Write**, **Pull requests: Write**. Without Actions: Read the bot still works via webhook; it will not poll `/actions/runs`.
 
 ## Setup
 

@@ -3,16 +3,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from collections.abc import AsyncIterator
 
 from adapters.coding_agent.issue_refs import extract_issue_number
 from adapters.github.copilot_login import is_copilot_login
 from config.settings import Settings
+from domain.errors import GitHubForbiddenError, GitHubUnavailableError
 from domain.models import EventType, PipelineEvent
 
 _FIX_TRIGGER_TEXT = "@copilot Fix the failing tests"
 _MAX_FIX_LOG_CHARS = 12_000
+logger = logging.getLogger(__name__)
 
 _COMPLETION_RE = re.compile(
     r"(task (is )?complete|ready for review|i('ve| have) completed)",
@@ -33,6 +36,7 @@ class CodingAgentAdapter:
         self._seen_pr_ids: set[int] = set()
         self._seen_run_ids: set[int] = set()
         self._draft_seen: set[int] = set()
+        self._actions_forbidden = False
 
     def _is_coding_agent_login(self, login: str) -> bool:
         return is_copilot_login(login, self.settings.copilot_username)
@@ -152,7 +156,22 @@ class CodingAgentAdapter:
     async def _poll_actions(
         self, issue_number: int, pr_number: int, branch: str
     ) -> AsyncIterator[PipelineEvent]:
-        runs = await self.github.actions.list_runs_for_branch(branch)
+        if self._actions_forbidden:
+            return
+        try:
+            runs = await self.github.actions.list_runs_for_branch(branch)
+        except GitHubForbiddenError:
+            self._actions_forbidden = True
+            logger.warning(
+                "GitHub Actions API forbidden; backup poll skips CI, webhook still works"
+            )
+            return
+        except GitHubUnavailableError:
+            logger.warning("GitHub Actions API unavailable during backup poll")
+            return
+        except Exception:
+            logger.exception("GitHub Actions backup poll failed")
+            return
         for run in runs:
             run_id = run.get("id")
             status = (run.get("status") or "").lower()
