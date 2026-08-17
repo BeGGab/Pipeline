@@ -14,3 +14,7 @@ class MergeError(UserFacingError):
 
 class GitHubUnavailableError(Exception):
     """Transport or API failure talking to GitHub — not an application bug."""
+
+
+class GitHubForbiddenError(GitHubUnavailableError):
+    """GitHub rejected the request with 403 (missing token scope or SSO)."""
