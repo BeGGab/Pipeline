@@ -8,11 +8,8 @@ import pytest
 
 from adapters.coding_agent.adapter import CodingAgentAdapter, _FIX_TRIGGER_TEXT
 from adapters.github.actions import ActionsClient
-from adapters.github.issues import (
-    _COPILOT_ASSIGNEE,
-    _COPILOT_ASSIGNEE_ALIASES,
-    IssuesClient,
-)
+from adapters.github.copilot_login import copilot_login_aliases, normalize_copilot_login
+from adapters.github.issues import IssuesClient
 from adapters.github.models import GitHubPullRequest, GitHubUser
 from config.settings import Settings
 from domain.clock import utcnow
@@ -125,9 +122,63 @@ async def test_bug002_003_fix_trigger_text_and_single_path(harness):
 
 def test_bug004_single_copilot_login():
     settings = Settings()
-    assert settings.copilot_username == "copilot-swe-agent[bot]"
-    assert _COPILOT_ASSIGNEE == "copilot-swe-agent[bot]"
-    assert "github-copilot[bot]" not in _COPILOT_ASSIGNEE_ALIASES
+    assert normalize_copilot_login(settings.copilot_username) == "copilot-swe-agent[bot]"
+    aliases = copilot_login_aliases(settings.copilot_username)
+    assert "copilot-swe-agent[bot]" in aliases
+    assert "github-copilot[bot]" not in aliases
+
+
+async def test_assign_uses_configured_copilot_username():
+    captured = {}
+
+    class _Http:
+        async def post(self, path, json=None):
+            captured["json"] = json
+
+            class Resp:
+                def json(self):
+                    return {"assignees": [{"login": "acme-copilot[bot]"}]}
+
+            return Resp()
+
+        async def get(self, path):
+            class Resp:
+                def json(self):
+                    return {"assignees": [{"login": "acme-copilot[bot]"}]}
+
+            return Resp()
+
+    client = IssuesClient(
+        _Http(), "acme", "repo", graphql=None, copilot_username="acme-copilot[bot]"
+    )
+    body = await client.assign_copilot(3)
+    assert captured["json"] == {"assignees": ["acme-copilot[bot]"]}
+    assert body["assignees"][0]["login"] == "acme-copilot[bot]"
+
+
+async def test_graphql_assign_succeeds_without_classic_assignee():
+    class _Graphql:
+        async def resolve_assignable_and_actor(self, **kwargs):
+            assert kwargs["actor_login"] == "copilot-swe-agent[bot]"
+            return "issue-id", "actor-id"
+
+        async def execute(self, query, variables=None):
+            assert "replaceActorsForAssignable" in query
+            return {"replaceActorsForAssignable": {"clientMutationId": "1"}}
+
+    class _Http:
+        async def post(self, path, json=None):
+            raise AssertionError("REST assign must not run after GraphQL success")
+
+    client = IssuesClient(
+        _Http(),
+        "acme",
+        "repo",
+        graphql=_Graphql(),
+        copilot_username="copilot-swe-agent[bot]",
+    )
+    result = await client.assign_copilot(3)
+    assert result == {"assigned": True}
 
 
 class _HttpAssign:
@@ -135,6 +186,16 @@ class _HttpAssign:
         self.assignees = assignees
 
     async def post(self, path, json=None):
+        class Resp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        return Resp({"assignees": self.assignees})
+
+    async def get(self, path):
         class Resp:
             def __init__(self, payload):
                 self._payload = payload
@@ -168,7 +229,12 @@ async def test_bug007_reviewer_bot_is_ignored():
     settings = Settings()
     adapter = CodingAgentAdapter(_Github(), settings)
     assert adapter._is_coding_agent_login("copilot-swe-agent[bot]") is True
+    assert adapter._is_coding_agent_login("copilot-swe-agent") is True
     assert adapter._is_coding_agent_login("copilot-pull-request-reviewer[bot]") is False
+    custom = Settings(copilot_username="acme-copilot[bot]")
+    custom_adapter = CodingAgentAdapter(_Github(), custom)
+    assert custom_adapter._is_coding_agent_login("acme-copilot[bot]") is True
+    assert custom_adapter._is_coding_agent_login("acme-copilot") is True
     event = adapter.parse_webhook_event(
         "issue_comment",
         {

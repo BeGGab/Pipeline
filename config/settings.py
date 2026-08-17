@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     github_repo: str = ""
     github_webhook_secret: str = ""
 
-    # Один официальный логин coding agent (назначение + комментарии + PR).
-    # Предположение про отдельный github-copilot[bot] — ошибочное, не используем.
+    # Official coding-agent login. Overridden by COPILOT_USERNAME.
+    # A separate github-copilot[bot] comment account is an erroneous assumption.
     copilot_username: str = "copilot-swe-agent[bot]"
     coding_agent_stale_timeout_sec: int = 1800
     coding_agent_poll_interval_sec: int = 30

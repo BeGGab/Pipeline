@@ -7,7 +7,7 @@ import re
 from collections.abc import AsyncIterator
 
 from adapters.coding_agent.issue_refs import extract_issue_number
-from adapters.github.issues import _COPILOT_ASSIGNEE_ALIASES
+from adapters.github.copilot_login import is_copilot_login
 from config.settings import Settings
 from domain.models import EventType, PipelineEvent
 
@@ -35,8 +35,7 @@ class CodingAgentAdapter:
         self._draft_seen: set[int] = set()
 
     def _is_coding_agent_login(self, login: str) -> bool:
-        allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
-        return (login or "").strip().lower() in allowed
+        return is_copilot_login(login, self.settings.copilot_username)
 
     async def trigger(self, issue_number: int) -> None:
         await self.github.issues.assign_copilot(issue_number)

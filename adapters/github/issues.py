@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+import logging
+
+from adapters.github.copilot_login import (
+    is_copilot_login,
+    normalize_copilot_login,
+)
 from domain.errors import AssignmentError
 
-# Агент использует один логин copilot-swe-agent[bot]
-# и для назначения, и для комментариев/PR.
-# Предположение про отдельный github-copilot[bot] — ошибочное, не используем.
-_COPILOT_ASSIGNEE = "copilot-swe-agent[bot]"
-_COPILOT_ASSIGNEE_ALIASES = frozenset({
-    "copilot-swe-agent[bot]",
-    "copilot-swe-agent",
-})
+logger = logging.getLogger(__name__)
 
 
 class IssuesClient:
-    def __init__(self, http, owner: str, repo: str, graphql=None) -> None:
+    def __init__(
+        self, http, owner: str, repo: str, graphql=None, *, copilot_username: str = ""
+    ) -> None:
         self._http = http
         self._owner = owner
         self._repo = repo
         self._graphql = graphql
+        self._copilot_username = normalize_copilot_login(copilot_username)
 
     async def create_issue(self, title: str, body: str) -> dict:
         resp = await self._http.post(
@@ -33,29 +35,34 @@ class IssuesClient:
         return resp.json()
 
     async def assign_copilot(self, issue_number: int):
+        graphql_ok = await self._assign_via_graphql(issue_number)
+        if graphql_ok:
+            return graphql_ok
+
         resp = await self._http.post(
             f"/repos/{self._owner}/{self._repo}/issues/{issue_number}/assignees",
-            json={"assignees": [_COPILOT_ASSIGNEE]},
+            json={"assignees": [self._copilot_username]},
         )
         body = resp.json()
-        assignees = body.get("assignees") or []
-        if self._assignees_include_copilot(assignees):
+        if self._assignees_include_copilot(body.get("assignees") or []):
             return body
-        graphql_body = await self._assign_via_graphql(issue_number)
-        if graphql_body and self._assignees_include_copilot(
-            graphql_body.get("assignees") or []
-        ):
-            return graphql_body
+
+        try:
+            fresh = await self.get_issue(issue_number)
+        except Exception:
+            fresh = {}
+        if self._assignees_include_copilot(fresh.get("assignees") or []):
+            return fresh
+
         raise AssignmentError(
-            f"GitHub принял запрос, но не назначил {_COPILOT_ASSIGNEE}. "
+            f"GitHub принял запрос, но не назначил {self._copilot_username}. "
             "Включите Copilot coding agent и проверьте права токена."
         )
 
     def _assignees_include_copilot(self, assignees) -> bool:
-        allowed = {alias.lower() for alias in _COPILOT_ASSIGNEE_ALIASES}
         for item in assignees:
             login = item.get("login") if isinstance(item, dict) else str(item)
-            if (login or "").lower() in allowed:
+            if is_copilot_login(login, self._copilot_username):
                 return True
         return False
 
@@ -67,7 +74,7 @@ class IssuesClient:
                 owner=self._owner,
                 repo=self._repo,
                 issue_number=issue_number,
-                actor_login=_COPILOT_ASSIGNEE,
+                actor_login=self._copilot_username,
             )
             data = await self._graphql.execute(
                 """
@@ -75,23 +82,15 @@ class IssuesClient:
                   replaceActorsForAssignable(input: {
                     assignableId: $assignableId, actorIds: $actorIds
                   }) {
-                    assignable {
-                      ... on Issue {
-                        assignees(first: 10) { nodes { login } }
-                      }
-                    }
+                    clientMutationId
                   }
                 }
                 """,
                 {"assignableId": issue_id, "actorIds": [actor_id]},
             )
-            nodes = (
-                data.get("replaceActorsForAssignable", {})
-                .get("assignable", {})
-                .get("assignees", {})
-                .get("nodes")
-                or []
-            )
-            return {"assignees": nodes}
-        except Exception:
+            if data.get("replaceActorsForAssignable") is not None:
+                return {"assigned": True}
+            return None
+        except Exception as exc:
+            logger.warning("GraphQL Copilot assign failed: %s", exc)
             return None
