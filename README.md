@@ -114,9 +114,11 @@ adapters/     GitHub, Telegram, coding agent, file/in-memory jobs
 orchestrator/ Job FSM, watchers, /diff, /merge
 ports/        Protocols — Telegram does not import GitHub
 webhooks/     Signature check → parse_webhook_event
-docs/         TZ, architecture, acceptance program
+docs/         TZ, architecture, AS-IS FSM, acceptance program
 ```
 
 ## Spec sources
 
 `AI-PIPELINE-PR-FIXES.txt` and `AI-PIPELINE-PR-FIXES.diff` in the repo root are the defect TZ (BUG-001…011) and PIPE-PR-001 (`/diff`, `/merge`) this tree implements.
+
+AS-IS workflow and FSM: [`docs/AS-IS-Workflow-and-FSM.md`](docs/AS-IS-Workflow-and-FSM.md).
